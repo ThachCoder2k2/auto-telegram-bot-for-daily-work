@@ -1,0 +1,2 @@
+"""Daily intel bot package."""
+
