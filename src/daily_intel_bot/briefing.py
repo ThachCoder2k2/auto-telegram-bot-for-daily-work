@@ -15,8 +15,13 @@ from daily_intel_bot.collectors import collect_hacker_news
 from daily_intel_bot.config import Settings
 from daily_intel_bot.models import SignalItem
 from daily_intel_bot.openai_client import AIBriefingSections, generate_ai_briefing_sections
+from daily_intel_bot.gemini_client import generate_ai_briefing_sections_gemini
+from daily_intel_bot.obs import get_logger
 from daily_intel_bot.persona import PersonaProfile, persona_intro, select_persona
 from daily_intel_bot.tavily_client import TavilySearchSpec, search_tavily
+
+
+_LOG = get_logger("briefing")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +114,7 @@ SOURCE_HINTS = (
 )
 
 MAX_BRIEFING_CHARS = 12000
-VISIBLE_NEWS_PER_CATEGORY = 1
+VISIBLE_NEWS_PER_CATEGORY = 3
 USER_AGENT = "clawbot-daily-intel-telegram/0.1"
 
 REJECT_KEYWORDS = {
@@ -190,27 +195,38 @@ def render_daily_briefing(
     lines.extend([_rule(), "📰 <b>1. News Radar</b>"])
     if persona:
         lines.append(_persona_quote(persona, persona.news_line))
+    top_pick = _top_pick(news_by_category)
+    if top_pick:
+        lines.append(
+            f"⭐ <b>Top pick:</b> {_impact_bar(top_pick.impact_score)} · "
+            f"<a href=\"{escape(top_pick.url)}\">{_shorten_html(top_pick.headline, 88)}</a>"
+        )
     for spec in _enabled_category_specs(settings):
         category_items = news_by_category.get(spec.key, [])
         lines.extend(["", f"{_category_icon(spec.key)} <b>{escape(spec.label)}</b>"])
         if not category_items:
-            lines.append("No strong signal found in the last 24h.")
+            lines.append("<i>No strong signal in the last 24h.</i>")
             continue
         display_items = [item for item in category_items if item.impact_score > 1]
         if display_items:
             lines.append(
-                f"🎯 <b>Why it matters:</b> {escape(_category_why_matters(spec.key, display_items, focus))}"
+                f"🎯 <i>{escape(_category_why_matters(spec.key, display_items, focus))}</i>"
             )
         for index, item in enumerate(display_items[:VISIBLE_NEWS_PER_CATEGORY], start=1):
-            if item.impact_score <= 1:
-                continue
             lines.append(
-                f"{index}. {_impact_label(item.impact_score)} {_source_badge(item)} {_shorten_html(item.headline, 54)} ({escape(item.source)})"
+                f"{index}. {_impact_bar(item.impact_score)} {_source_badge(item)}"
             )
-            lines.append(f"   <a href=\"{escape(item.url)}\">Read article</a>")
+            lines.append(f"   <b>{_shorten_html(item.headline, 100)}</b>")
+            if index == 1:
+                summary = _clean_summary(item.summary)
+                if summary:
+                    lines.append(f"   <i>{_shorten_html(summary, 150)}</i>")
+            lines.append(
+                f"   🔗 <a href=\"{escape(item.url)}\">{escape(item.source)}</a>"
+            )
         hidden_count = max(0, len(display_items) - VISIBLE_NEWS_PER_CATEGORY)
         if hidden_count:
-            lines.append(f"+{hidden_count} scanned")
+            lines.append(f"   <i>+{hidden_count} more scanned</i>")
 
     if ai_sections:
         game_idea, web_idea = ai_sections.game_idea, ai_sections.web_idea
@@ -227,11 +243,14 @@ def render_daily_briefing(
         lines.append("🤖 <i>AI-assisted from today's sources.</i>")
     if persona:
         lines.append(_persona_quote(persona, persona.inspiration_line))
-    game_idea = _shorten(game_idea, 110)
-    game_feel = _shorten(game_feel, 78)
-    prototype_task = _shorten(prototype_task, 78)
-    web_idea = _shorten(web_idea, 96)
-    web_use = _shorten(web_use, 72)
+    if not ai_sections:
+        # Only the rule-based fallback needs clamping; AI text is already
+        # word-limited by the prompt, so clamping it just cut off payload.
+        game_idea = _shorten(game_idea, 150)
+        game_feel = _shorten(game_feel, 110)
+        prototype_task = _shorten(prototype_task, 110)
+        web_idea = _shorten(web_idea, 130)
+        web_use = _shorten(web_use, 100)
     lines.append(f"🎮 <b>Mechanic:</b> {escape(game_idea)}")
     lines.append(f"😨 <b>How it feels:</b> {escape(game_feel)}")
     lines.append(f"🛠️ <b>Tiny prototype:</b> {escape(prototype_task)}")
@@ -289,6 +308,18 @@ def render_daily_briefing(
     lines.extend([_rule(), "💾 <b>5. State</b>"])
     if persona:
         lines.append(_persona_quote(persona, persona.closing_line))
+    scanned = sum(len(items) for items in news_by_category.values())
+    provider = (
+        "Gemini"
+        if settings.ai_provider == "gemini" and settings.gemini_api_key
+        else "OpenAI"
+        if settings.openai_enabled and settings.openai_api_key
+        else "local rules"
+    )
+    lines.append(
+        f"🤖 <i>{scanned} items scanned · AI: {escape(provider)} · "
+        f"generated {now.strftime('%H:%M')} {escape(settings.timezone.split('/')[-1])}</i>"
+    )
     lines.append(
         f"[PERSISTENCE: {now.strftime('%Y-%m-%d')} | Tasks Remaining: {escape(task_text)} | Current Project Focus: {escape(focus)}]"
     )
@@ -365,7 +396,13 @@ def _collect_category_news(
                     max_results=max(settings.news_items_per_category * 2, 5),
                 ),
             )
-        except Exception:
+        except Exception as exc:
+            _LOG.warning(
+                "Tavily search failed for %s: %s: %s",
+                spec.key,
+                type(exc).__name__,
+                exc,
+            )
             results = []
         items = []
         for result in results:
@@ -420,7 +457,7 @@ def _hacker_news_fallback(
         fallback_items.append(
             BriefingNewsItem(
                 category=spec.key,
-                headline=f"{item.title} (HN fallback)",
+                headline=item.title,
                 impact_score=max(5, min(9, int(item.score_hint + 5))),
                 url=item.url,
                 source=item.source,
@@ -650,7 +687,11 @@ def _generate_ai_sections(
     now: datetime,
     persona: PersonaProfile | None,
 ) -> AIBriefingSections | None:
-    if not settings.openai_enabled or not settings.openai_api_key:
+    use_gemini = settings.ai_provider == "gemini"
+    if use_gemini:
+        if not settings.gemini_api_key:
+            return None
+    elif not settings.openai_enabled or not settings.openai_api_key:
         return None
     context = {
         "date": now.strftime("%Y-%m-%d"),
@@ -669,13 +710,27 @@ def _generate_ai_sections(
         },
         "persona": _persona_context(settings, persona),
     }
+    provider = "gemini" if use_gemini else "openai"
     try:
-        sections = generate_ai_briefing_sections(
-            settings.openai_api_key,
-            settings.openai_model,
-            context,
+        if use_gemini:
+            sections = generate_ai_briefing_sections_gemini(
+                settings.gemini_api_key,
+                settings.gemini_model,
+                context,
+            )
+        else:
+            sections = generate_ai_briefing_sections(
+                settings.openai_api_key,
+                settings.openai_model,
+                context,
+            )
+    except Exception as exc:
+        _LOG.warning(
+            "AI sections via %s failed, using rule-based fallback: %s: %s",
+            provider,
+            type(exc).__name__,
+            exc,
         )
-    except Exception:
         return None
     if len(sections.sentence_structures) < 3 or len(sections.vocabulary) < 5:
         return None
@@ -1233,14 +1288,67 @@ def _impact_label(score: int) -> str:
     return f"<b>[{score}/10 {label}]</b>"
 
 
+def _impact_bar(score: int) -> str:
+    score = max(0, min(10, score))
+    filled = round(score / 2)  # 5-segment bar
+    return "▰" * filled + "▱" * (5 - filled) + f" {score}/10"
+
+
+_SUMMARY_BOILERPLATE = (
+    "enter your email",
+    "sign up",
+    "subscribe",
+    "newsletter",
+    "confirmation",
+    "cookie",
+    "privacy policy",
+    "latest gaming news first",
+    "terms of service",
+    "create an account",
+)
+
+
+def _clean_summary(summary: str) -> str:
+    """Flatten a source snippet into one clean sentence-ish line.
+
+    Drops obvious newsletter/cookie boilerplate that scrapers often capture
+    instead of real article text.
+    """
+    text = unescape(re.sub(r"<[^>]+>", "", summary or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    lowered = text.lower()
+    if any(marker in lowered for marker in _SUMMARY_BOILERPLATE):
+        return ""
+    return text
+
+
+def _top_pick(
+    news_by_category: dict[str, list[BriefingNewsItem]],
+) -> BriefingNewsItem | None:
+    best: BriefingNewsItem | None = None
+    for items in news_by_category.values():
+        for item in items:
+            if item.impact_score <= 1:
+                continue
+            if best is None or item.impact_score > best.impact_score:
+                best = item
+    return best
+
+
 def _rule() -> str:
     return "----------------------------------------"
 
 
 def _shorten(value: str, limit: int) -> str:
+    value = value.strip()
     if len(value) <= limit:
         return value
-    return value[: limit - 3].rstrip() + "..."
+    clipped = value[: limit - 1]
+    # Prefer a word boundary so we never cut mid-word or mid-number.
+    space = clipped.rfind(" ")
+    if space >= limit * 0.6:
+        clipped = clipped[:space]
+    return clipped.rstrip(" ,.;:-") + "…"
 
 
 def _shorten_html(value: str, limit: int) -> str:

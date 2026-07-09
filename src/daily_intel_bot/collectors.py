@@ -11,10 +11,12 @@ import xml.etree.ElementTree as ET
 
 from daily_intel_bot.config import Settings
 from daily_intel_bot.models import SignalItem, StatItem
+from daily_intel_bot.obs import get_logger, with_retries
 from daily_intel_bot.tavily_client import TavilySearchSpec, search_tavily
 
 
 USER_AGENT = "clawbot-daily-intel-telegram/0.1"
+_LOG = get_logger("collectors")
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,16 +269,22 @@ def collect_world_bank_stats() -> list[StatItem]:
 
 
 def _fetch_json(url: str) -> object:
-    req = request.Request(url, headers={"User-Agent": USER_AGENT})
-    with request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    def _do() -> object:
+        req = request.Request(url, headers={"User-Agent": USER_AGENT})
+        with request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    return with_retries(_do, attempts=3, logger=_LOG, label=f"GET {url}")
 
 
 def _fetch_xml(url: str) -> ET.Element:
-    req = request.Request(url, headers={"User-Agent": USER_AGENT})
-    with request.urlopen(req, timeout=20) as resp:
-        content = resp.read()
-    return ET.fromstring(content)
+    def _do() -> ET.Element:
+        req = request.Request(url, headers={"User-Agent": USER_AGENT})
+        with request.urlopen(req, timeout=20) as resp:
+            content = resp.read()
+        return ET.fromstring(content)
+
+    return with_retries(_do, attempts=3, logger=_LOG, label=f"GET {url}")
 
 
 def _extract_feed_entries(root: ET.Element) -> list[dict[str, str]]:

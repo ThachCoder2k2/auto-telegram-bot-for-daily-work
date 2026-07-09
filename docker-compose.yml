@@ -1,0 +1,22 @@
+services:
+  daily-intel-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: clawbot-daily-intel:latest
+    container_name: clawbot-daily-intel
+    env_file:
+      - .env
+    environment:
+      # Scheduler knobs (override in .env or here). Times use TIMEZONE below.
+      TIMEZONE: ${TIMEZONE:-Asia/Ho_Chi_Minh}
+      DAILY_SEND_HOUR: ${DAILY_SEND_HOUR:-8}
+      DAILY_SEND_MINUTE: ${DAILY_SEND_MINUTE:-0}
+      RUN_ON_START: ${RUN_ON_START:-false}
+      # App writes db/json here; must match the mounted volume.
+      STATE_DB_PATH: /app/state/daily_intel.db
+      BRIEFING_STATE_PATH: /app/state/briefing_state.json
+    volumes:
+      # Persist sent-item history + briefing state across restarts.
+      - ./state:/app/state
+    restart: unless-stopped

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from daily_intel_bot.briefing import persist_briefing_state
 from daily_intel_bot.config import load_settings
+from daily_intel_bot.obs import get_logger, setup_logging
 from daily_intel_bot.persona import (
     select_persona,
     select_persona_image,
@@ -38,8 +39,27 @@ def build_sample_digest(timezone: str) -> str:
     )
 
 
+def _require_telegram(settings) -> None:
+    """Fail fast (exit 2) if delivery credentials are missing."""
+    missing = [
+        name
+        for name, value in (
+            ("TELEGRAM_BOT_TOKEN", settings.telegram_bot_token),
+            ("TELEGRAM_CHAT_ID", settings.telegram_chat_id),
+        )
+        if not value
+    ]
+    if missing:
+        get_logger("main").error(
+            "missing required env for delivery: %s", ", ".join(missing)
+        )
+        print(f"error: missing required env: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(2)
+
+
 def main() -> None:
     _configure_stdout()
+    setup_logging()
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -65,6 +85,9 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = load_settings()
+
+    if args.send_test or args.send_sample_digest or args.send_digest:
+        _require_telegram(settings)
 
     if args.send_test:
         result = send_message(settings, "Direct Telegram test message from Clawbot")
