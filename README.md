@@ -172,7 +172,10 @@ the project backlog.
 
 **Reminder engine** — the board's `Reminder`, `Reminder Frequency` and
 `Last Reminded` columns only mean something once a process compares them to the
-clock. The command poller does that every `NOTION_REMINDER_CHECK_SECONDS`:
+clock. The command poller does that every `NOTION_REMINDER_CHECK_SECONDS`
+(default hourly — the finest frequency the board offers, so checking more
+often only burns API calls; the 30s figure in the logs is the Telegram
+long-poll that keeps commands responsive, not the reminder cadence):
 a task with `Reminder` ticked and a frequency of *Once / Every hour / Every 2
 hours / Every 4 hours / Every day / Every week* is nudged when its interval has
 elapsed, then `Last Reminded` is stamped so the interval advances. Unknown
@@ -182,6 +185,11 @@ hourly spam.
 Nudges are held outside `NOTION_QUIET_START`–`NOTION_QUIET_END`; one that comes
 due overnight fires at the first check after the window opens. A window that
 wraps midnight (22→6) is treated as a union, not an empty range.
+
+Due-checks allow half the check cadence as tolerance. When the cadence equals
+the interval — hourly checks against an *Every hour* task — every check
+measures a hair under an hour, so a strict comparison would skip every other
+one and quietly turn an hourly reminder into a two-hourly one.
 
 Notion being down costs the task block and the nudges, never the brief.
 

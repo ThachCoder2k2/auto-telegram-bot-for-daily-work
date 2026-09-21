@@ -56,19 +56,29 @@ def due_reminders(
     tasks: list[NotionTask],
     now: datetime,
     window: ReminderWindow,
+    tolerance: timedelta = timedelta(0),
 ) -> list[NotionTask]:
     """Tasks whose reminder interval has elapsed, most urgent first.
 
     Outside the window nothing is due; a reminder that came up at 03:00 simply
     fires at the first check after the window reopens.
+
+    ``tolerance`` lets a check that lands fractionally early still fire. When
+    the check cadence equals the reminder interval — hourly checks against an
+    "Every hour" task — each check measures a hair under the interval and
+    would otherwise skip, silently halving the reminder rate.
     """
     if not window.is_open(now):
         return []
-    due = [task for task in tasks if _is_due(task, now)]
+    due = [task for task in tasks if _is_due(task, now, tolerance)]
     return sorted(due, key=_urgency)
 
 
-def _is_due(task: NotionTask, now: datetime) -> bool:
+def _is_due(
+    task: NotionTask,
+    now: datetime,
+    tolerance: timedelta = timedelta(0),
+) -> bool:
     if not task.reminder or task.is_done:
         return False
     frequency = task.reminder_frequency.strip().lower()
@@ -81,7 +91,7 @@ def _is_due(task: NotionTask, now: datetime) -> bool:
         return False
     if task.last_reminded is None:
         return True
-    return now - task.last_reminded >= interval
+    return now - task.last_reminded >= interval - tolerance
 
 
 def _urgency(task: NotionTask) -> tuple[int, float]:

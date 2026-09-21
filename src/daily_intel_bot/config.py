@@ -95,7 +95,9 @@ class Settings(BaseSettings):
     # the user at 03:00; a reminder that came due overnight fires at the open.
     notion_quiet_start: int = 8
     notion_quiet_end: int = 22
-    notion_reminder_check_seconds: int = 300
+    # How often the poller looks for due reminders. The finest frequency the
+    # board offers is hourly, so checking more often only burns API calls.
+    notion_reminder_check_seconds: int = 3600
     # Overrides for when schema auto-detection picks the wrong column.
     notion_prop_status: str = ""
     notion_prop_priority: str = ""

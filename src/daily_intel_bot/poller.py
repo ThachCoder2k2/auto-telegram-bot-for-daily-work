@@ -8,7 +8,7 @@ silently turns every command the user sends into a no-op.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from zoneinfo import ZoneInfo
 
@@ -93,7 +93,11 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         start_hour=settings.notion_quiet_start,
         end_hour=settings.notion_quiet_end,
     )
-    due = due_reminders(board.tasks, now, window)
+    # Half the check cadence: enough slack that a check landing just shy of
+    # the interval still fires, without letting a reminder arrive early enough
+    # to matter.
+    tolerance = timedelta(seconds=settings.notion_reminder_check_seconds / 2)
+    due = due_reminders(board.tasks, now, window, tolerance)
     sent = 0
     for task in due:
         try:

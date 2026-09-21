@@ -249,6 +249,26 @@ def test_window_wrapping_midnight_is_a_union_not_an_empty_range():
     assert not window.is_open(datetime(2026, 9, 21, 12, tzinfo=UTC))
 
 
+def test_hourly_check_does_not_halve_an_hourly_reminder():
+    """Check cadence equal to the interval always measures a hair under it.
+
+    Without tolerance an "Every hour" task checked hourly would skip every
+    other check and effectively become two-hourly.
+    """
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    task = _task(last=now - timedelta(minutes=59, seconds=58))
+    assert due_reminders([task], now, ReminderWindow(0, 0)) == []
+    tolerance = timedelta(seconds=1800)  # half of an hourly check
+    assert due_reminders([task], now, ReminderWindow(0, 0), tolerance) == [task]
+
+
+def test_tolerance_does_not_fire_a_reminder_far_too_early():
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    task = _task(frequency="Every day", last=now - timedelta(hours=2))
+    tolerance = timedelta(seconds=1800)
+    assert due_reminders([task], now, ReminderWindow(0, 0), tolerance) == []
+
+
 def test_reminders_sorted_by_priority():
     now = datetime(2026, 9, 21, 12, tzinfo=UTC)
     low = _task("low one", priority="Low", last=None, page_id="a")
