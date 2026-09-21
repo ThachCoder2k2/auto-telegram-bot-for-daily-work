@@ -29,7 +29,7 @@ from daily_intel_bot.gemini_client import (
     generate_ai_briefing_sections_gemini,
     generate_item_takes_gemini,
 )
-from daily_intel_bot.obs import get_logger
+from daily_intel_bot.obs import get_logger, is_transient_http_error, with_retries
 from daily_intel_bot.persona import PersonaProfile, persona_intro, select_persona
 from daily_intel_bot.state_store import StateStore, current_streak
 from daily_intel_bot.tavily_client import TavilySearchSpec, search_tavily
@@ -623,18 +623,27 @@ def _apply_item_takes(
             tasks,
             settings.briefing_location,
         )
-        if use_gemini:
-            payload = generate_item_takes_gemini(
-                settings.gemini_api_key,
-                settings.gemini_model,
-                context,
-            )
-        else:
-            payload = generate_item_takes(
+        def _call() -> dict[str, object]:
+            if use_gemini:
+                return generate_item_takes_gemini(
+                    settings.gemini_api_key,
+                    settings.gemini_model,
+                    context,
+                )
+            return generate_item_takes(
                 settings.openai_api_key,
                 settings.openai_model,
                 context,
             )
+
+        payload = with_retries(
+            _call,
+            attempts=2,
+            backoff=3.0,
+            logger=_LOG,
+            label="item takes",
+            should_retry=is_transient_http_error,
+        )
         takes = parse_takes(payload, len(requests))
     except Exception as exc:  # noqa: BLE001 - enrichment is strictly optional
         _LOG.warning(
@@ -1322,19 +1331,31 @@ def _generate_ai_sections(
         "persona": _persona_context(settings, persona),
     }
     provider = "gemini" if use_gemini else "openai"
-    try:
+
+    def _call() -> AIBriefingSections:
         if use_gemini:
-            sections = generate_ai_briefing_sections_gemini(
+            return generate_ai_briefing_sections_gemini(
                 settings.gemini_api_key,
                 settings.gemini_model,
                 context,
             )
-        else:
-            sections = generate_ai_briefing_sections(
-                settings.openai_api_key,
-                settings.openai_model,
-                context,
-            )
+        return generate_ai_briefing_sections(
+            settings.openai_api_key,
+            settings.openai_model,
+            context,
+        )
+
+    try:
+        # Retry transient faults before giving up: a single 503 used to drop
+        # the whole brief to the rule-based fallback for the day.
+        sections = with_retries(
+            _call,
+            attempts=3,
+            backoff=3.0,
+            logger=_LOG,
+            label=f"AI sections via {provider}",
+            should_retry=is_transient_http_error,
+        )
     except Exception as exc:
         _LOG.warning(
             "AI sections via %s failed, using rule-based fallback: %s: %s",

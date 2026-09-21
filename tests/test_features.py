@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from urllib.error import HTTPError
 
 import pytest
 
@@ -10,6 +11,7 @@ from daily_intel_bot import briefing, commands, poller, telegram_updates
 from daily_intel_bot.briefing import BriefingNewsItem, FeedMemory
 from daily_intel_bot.commands import handle_command
 from daily_intel_bot.config import Settings
+from daily_intel_bot.obs import is_transient_http_error, with_retries
 from daily_intel_bot.state_store import StateStore, current_streak
 from daily_intel_bot.telegram_updates import _is_authorized, _parse_message
 
@@ -397,6 +399,53 @@ def test_recurring_terms_need_multiple_headlines(settings):
     assert terms.get("regulation") == 3
     # A word repeated inside one headline must not create a trend on its own.
     assert "agents" in terms
+
+
+# --- retry policy ---------------------------------------------------------
+
+
+def test_transient_errors_are_retryable():
+    """Observed live: Gemini answered 503 and the brief lost its AI sections."""
+    assert is_transient_http_error(HTTPError("u", 503, "busy", {}, None))
+    assert is_transient_http_error(HTTPError("u", 429, "slow down", {}, None))
+    assert is_transient_http_error(TimeoutError())
+
+
+def test_client_errors_are_not_retried():
+    assert not is_transient_http_error(HTTPError("u", 401, "bad key", {}, None))
+    assert not is_transient_http_error(HTTPError("u", 400, "bad request", {}, None))
+
+
+def test_non_retryable_failure_raises_immediately():
+    calls = {"n": 0}
+
+    def _fail():
+        calls["n"] += 1
+        raise HTTPError("u", 401, "bad key", {}, None)
+
+    with pytest.raises(HTTPError):
+        with_retries(
+            _fail, attempts=3, backoff=0, should_retry=is_transient_http_error
+        )
+    assert calls["n"] == 1  # no pointless retries on a bad key
+
+
+def test_transient_failure_is_retried_then_succeeds():
+    calls = {"n": 0}
+
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise HTTPError("u", 503, "busy", {}, None)
+        return "ok"
+
+    assert (
+        with_retries(
+            _flaky, attempts=3, backoff=0, should_retry=is_transient_http_error
+        )
+        == "ok"
+    )
+    assert calls["n"] == 3
 
 
 # --- inbound parsing ------------------------------------------------------
