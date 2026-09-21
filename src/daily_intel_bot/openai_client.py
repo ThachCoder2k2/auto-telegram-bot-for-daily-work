@@ -5,6 +5,7 @@ import json
 from urllib import request
 
 from daily_intel_bot.enrich import TAKES_INSTRUCTIONS, takes_response_schema
+from daily_intel_bot.nudge_voice import NUDGE_INSTRUCTIONS, nudge_response_schema
 
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -139,6 +140,49 @@ def generate_item_takes(
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
         raise ValueError("OpenAI takes response was not a JSON object")
+    return parsed
+
+
+def generate_nudge_voice(
+    api_key: str,
+    model: str,
+    context: dict[str, object],
+) -> dict[str, object]:
+    """Ask OpenAI to write a nudge in the day's persona voice."""
+    body = {
+        "model": model,
+        "instructions": NUDGE_INSTRUCTIONS,
+        "input": json.dumps(context, ensure_ascii=False),
+        "max_output_tokens": 700,
+        "text": {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "daily_intel_nudge_voice",
+                "strict": True,
+                "schema": nudge_response_schema(),
+            },
+        },
+    }
+    payload = json.dumps(body).encode("utf-8")
+    req = request.Request(
+        OPENAI_RESPONSES_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    with request.urlopen(req, timeout=45) as resp:
+        response_payload = json.loads(resp.read().decode("utf-8"))
+    text = _extract_output_text(response_payload)
+    if not text:
+        raise ValueError("OpenAI response did not include output text")
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("OpenAI nudge response was not a JSON object")
     return parsed
 
 

@@ -20,7 +20,15 @@ from daily_intel_bot.notion_tasks import (
     load_notes_quietly,
     stamp_reminded,
 )
-from daily_intel_bot.obs import get_logger
+from daily_intel_bot.gemini_client import generate_nudge_voice_gemini
+from daily_intel_bot.nudge_voice import (
+    NudgeVoice,
+    note_context,
+    parse_nudge_voice,
+    task_context,
+)
+from daily_intel_bot.obs import get_logger, is_transient_http_error, with_retries
+from daily_intel_bot.openai_client import generate_nudge_voice
 from daily_intel_bot.persona import select_persona
 from daily_intel_bot.reminders import (
     ReminderWindow,
@@ -132,10 +140,17 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         forced_key=settings.bot_persona_force,
         now=now,
     )
+    voice = _write_voice(
+        settings,
+        task_context(due, now, counts, persona, settings.bot_persona_safe_mode),
+        len(due),
+    )
     try:
         # One batched message: three separately-worded nudges an hour apart is
         # a notification, three identical ones at once is just noise.
-        send_message(settings, render_reminder_batch(due, now, persona, counts))
+        send_message(
+            settings, render_reminder_batch(due, now, persona, counts, voice)
+        )
     except Exception as exc:  # noqa: BLE001 - a failed nudge retries next cycle
         _LOG.warning("reminder send failed: %s: %s", type(exc).__name__, exc)
         return 0
@@ -181,8 +196,13 @@ def send_due_note_alerts(settings: Settings, store: StateStore) -> int:
         forced_key=settings.bot_persona_force,
         now=now,
     )
+    voice = _write_voice(
+        settings,
+        note_context(fresh, now, persona, settings.bot_persona_safe_mode),
+        len(fresh),
+    )
     try:
-        send_message(settings, render_note_alert(fresh, now, persona))
+        send_message(settings, render_note_alert(fresh, now, persona, voice))
     except Exception as exc:  # noqa: BLE001 - retried on the next check
         _LOG.warning("note alert failed: %s: %s", type(exc).__name__, exc)
         return 0
@@ -191,6 +211,54 @@ def send_due_note_alerts(settings: Settings, store: StateStore) -> int:
         store.set_meta(_note_alert_key(entry.page_id), today)
     _LOG.info("sent note alert covering %d dated entry(ies)", len(fresh))
     return len(fresh)
+
+
+def _write_voice(
+    settings: Settings,
+    context: dict[str, object],
+    count: int,
+) -> NudgeVoice | None:
+    """Have the AI backend write the nudge, or fall back to canned lines.
+
+    The brief reads as alive because a model writes it against that day's real
+    material; nudges deserve the same treatment. Best-effort by design: a
+    rate-limited model costs the flourish, not the reminder.
+    """
+    if not settings.notion_ai_voice_enabled:
+        return None
+    use_gemini = settings.ai_provider == "gemini"
+    if use_gemini:
+        if not settings.gemini_api_key:
+            return None
+    elif not settings.openai_enabled or not settings.openai_api_key:
+        return None
+
+    def _call() -> dict:
+        if use_gemini:
+            return generate_nudge_voice_gemini(
+                settings.gemini_api_key, settings.gemini_model, context
+            )
+        return generate_nudge_voice(
+            settings.openai_api_key, settings.openai_model, context
+        )
+
+    try:
+        payload = with_retries(
+            _call,
+            attempts=2,
+            backoff=2.0,
+            logger=_LOG,
+            label="nudge voice",
+            should_retry=is_transient_http_error,
+        )
+        return parse_nudge_voice(payload, count)
+    except Exception as exc:  # noqa: BLE001 - voice is a flourish, not the point
+        _LOG.warning(
+            "nudge voice unavailable, using canned lines: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
 
 
 def _note_alert_key(page_id: str) -> str:

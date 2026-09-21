@@ -11,6 +11,7 @@ import json
 from urllib import request
 
 from daily_intel_bot.enrich import TAKES_INSTRUCTIONS, takes_response_schema
+from daily_intel_bot.nudge_voice import NUDGE_INSTRUCTIONS, nudge_response_schema
 from daily_intel_bot.openai_client import (
     AIBriefingSections,
     _parse_sections,
@@ -129,6 +130,48 @@ def generate_item_takes_gemini(
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
         raise ValueError("Gemini takes response was not a JSON object")
+    return parsed
+
+
+def generate_nudge_voice_gemini(
+    api_key: str,
+    model: str,
+    context: dict[str, object],
+) -> dict[str, object]:
+    """Ask Gemini to write a nudge in the day's persona voice."""
+    body = {
+        "systemInstruction": {"parts": [{"text": NUDGE_INSTRUCTIONS}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": json.dumps(context, ensure_ascii=False)}],
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": _to_gemini(nudge_response_schema()),
+            "thinkingConfig": {"thinkingBudget": 0},
+            "maxOutputTokens": 800,
+            # Warmer than the factual calls: this text exists to have a voice.
+            "temperature": 0.95,
+        },
+    }
+    payload = json.dumps(body).encode("utf-8")
+    url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={api_key}"
+    req = request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST",
+    )
+    with request.urlopen(req, timeout=45) as resp:
+        response_payload = json.loads(resp.read().decode("utf-8"))
+    text = _extract_output_text(response_payload)
+    if not text:
+        raise ValueError("Gemini response did not include output text")
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Gemini nudge response was not a JSON object")
     return parsed
 
 

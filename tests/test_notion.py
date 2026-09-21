@@ -17,6 +17,12 @@ from daily_intel_bot.notion_client import (
     detect_notes_schema,
     detect_schema,
 )
+from daily_intel_bot.nudge_voice import (
+    NudgeVoice,
+    note_context,
+    parse_nudge_voice,
+    task_context,
+)
 from daily_intel_bot.persona import PERSONA_PROFILES
 from daily_intel_bot.reminders import (
     NAG_THRESHOLD,
@@ -630,3 +636,72 @@ def test_note_line_lists_attendees_when_present():
 def test_note_content_is_escaped():
     rendered = render_note_line(_note(title="A & B <b>", days=1), NOW)
     assert "A &amp; B &lt;b&gt;" in rendered
+
+
+# --- AI nudge voice -------------------------------------------------------
+
+
+def test_parse_nudge_voice_keeps_only_asides_in_range():
+    voice = parse_nudge_voice(
+        {
+            "opening": "Seventy-four days, my lord.",
+            "asides": [
+                {"id": 0, "line": "This one rots."},
+                {"id": 9, "line": "out of range"},
+                {"id": 1, "line": "   "},
+                "not a dict",
+            ],
+            "closing": "Do not falter.",
+        },
+        count=2,
+    )
+    assert voice.opening == "Seventy-four days, my lord."
+    assert voice.asides == {0: "This one rots."}
+    assert voice.closing == "Do not falter."
+
+
+def test_parse_nudge_voice_rejects_an_empty_opening():
+    with pytest.raises(ValueError):
+        parse_nudge_voice({"opening": "  ", "asides": [], "closing": ""}, count=1)
+
+
+def test_ai_voice_replaces_the_canned_line():
+    persona = PERSONA_PROFILES["rot_maiden"]
+    voice = NudgeVoice(
+        opening="Seventy-four days, my lord.",
+        asides={0: "This scroll gathers dust."},
+        closing="Do not falter.",
+    )
+    rendered = render_reminder_batch([_task(page_id="p1")], NOW, persona, {}, voice)
+    assert "Seventy-four days, my lord." in rendered
+    assert "This scroll gathers dust." in rendered
+    assert "Do not falter." in rendered
+    assert persona.reminder_line not in rendered
+
+
+def test_canned_line_is_used_when_the_model_is_unavailable():
+    """A rate-limited model costs the flourish, not the reminder."""
+    persona = PERSONA_PROFILES["rot_maiden"]
+    rendered = render_reminder_batch([_task(page_id="p1")], NOW, persona, {}, None)
+    assert persona.reminder_line in rendered
+
+
+def test_ai_voice_is_escaped_like_any_other_text():
+    voice = NudgeVoice(opening="A & B <b>", asides={}, closing="")
+    rendered = render_reminder_batch([_task(page_id="p1")], NOW, None, {}, voice)
+    assert "A &amp; B &lt;b&gt;" in rendered
+
+
+def test_task_context_carries_the_numbers_the_voice_needs():
+    task = _replace_idle(_task("Old one", page_id="p1"), days=10)
+    context = task_context([task], NOW, {"p1": 4}, PERSONA_PROFILES["rot_maiden"], True)
+    item = context["items"][0]
+    assert item["days_open"] == 11
+    assert item["times_nudged"] == 4
+    assert context["persona"]["name"] == "The Rot Maiden"
+
+
+def test_note_context_marks_itself_as_a_heads_up_not_a_scolding():
+    context = note_context([_note(days=2)], NOW, None, True)
+    assert context["kind"] == "dated_notes"
+    assert context["items"][0]["days_until"] == 2

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from html import escape
 
 from daily_intel_bot.notion_client import NoteEntry, NotionTask
+from daily_intel_bot.nudge_voice import NudgeVoice
 from daily_intel_bot.persona import PersonaProfile
 
 
@@ -168,6 +169,7 @@ def render_reminder_batch(
     now: datetime,
     persona: PersonaProfile | None,
     reminder_counts: dict[str, int],
+    voice: NudgeVoice | None = None,
 ) -> str:
     """One message for the whole batch, in the day's persona voice.
 
@@ -181,9 +183,15 @@ def render_reminder_batch(
 
     lines: list[str] = []
     if persona:
-        voice = persona.nag_line if nagging else persona.reminder_line
+        # Prefer what the model wrote against today's actual board; the canned
+        # lines are the offline fallback, not the default.
+        opening = voice.opening if voice else (
+            persona.nag_line if nagging else persona.reminder_line
+        )
         lines.append(f"{persona.icon} <b>{escape(persona.name)}</b>")
-        lines.append(f"<blockquote>{escape(voice)}</blockquote>")
+        lines.append(f"<blockquote>{escape(opening)}</blockquote>")
+    elif voice:
+        lines.append(f"<blockquote>{escape(voice.opening)}</blockquote>")
     else:
         lines.append("⏰ <b>Still open</b>" if not nagging else "⏰ <b>Still open. Again.</b>")
     lines.append("")
@@ -197,11 +205,18 @@ def render_reminder_batch(
         detail = _task_signals(task, now, reminder_counts.get(task.page_id, 0))
         if detail:
             lines.append(f"   <i>{escape(' · '.join(detail))}</i>")
+        aside = voice.asides.get(index - 1) if voice else None
+        if aside:
+            lines.append(f"   <i>{escape(aside)}</i>")
 
     gaps = describe_gaps(tasks, now, reminder_counts)
     if gaps:
         lines.append("")
         lines.extend(f"⚠️ <i>{escape(gap)}</i>" for gap in gaps)
+
+    if voice and voice.closing:
+        lines.append("")
+        lines.append(f"<i>{escape(voice.closing)}</i>")
 
     lines.append("")
     lines.append(
@@ -365,6 +380,7 @@ def render_note_alert(
     entries: list[NoteEntry],
     now: datetime,
     persona: PersonaProfile | None,
+    voice: NudgeVoice | None = None,
 ) -> str:
     """A rare, dated heads-up — distinct in tone from the task nagging."""
     # Explicit None check: "days or 99" would read an entry due *today* as 99
@@ -375,12 +391,22 @@ def render_note_alert(
     soonest = min(horizons) if horizons else 99
     lines: list[str] = []
     if persona:
+        opening = voice.opening if voice else _note_voice(persona, soonest)
         lines.append(f"{persona.icon} <b>{escape(persona.name)}</b>")
-        lines.append(f"<blockquote>{escape(_note_voice(persona, soonest))}</blockquote>")
+        lines.append(f"<blockquote>{escape(opening)}</blockquote>")
+    elif voice:
+        lines.append(f"<blockquote>{escape(voice.opening)}</blockquote>")
     else:
         lines.append("🗓️ <b>Coming up</b>")
     lines.append("")
-    lines.extend(render_note_line(entry, now) for entry in entries)
+    for index, entry in enumerate(entries):
+        lines.append(render_note_line(entry, now))
+        aside = voice.asides.get(index) if voice else None
+        if aside:
+            lines.append(f"   <i>{escape(aside)}</i>")
+    if voice and voice.closing:
+        lines.append("")
+        lines.append(f"<i>{escape(voice.closing)}</i>")
     return "\n".join(lines)
 
 

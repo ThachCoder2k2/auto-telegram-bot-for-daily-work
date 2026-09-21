@@ -110,6 +110,9 @@ class Settings(BaseSettings):
     notion_notes_database_id: str = ""
     notion_notes_lookahead_days: int = 14
     notion_notes_alert_days: int = 3
+    # Let the AI backend write the nudge in the day's persona voice, the way
+    # it already writes the brief. Falls back to the canned persona lines.
+    notion_ai_voice_enabled: bool = True
     notion_prop_status: str = ""
     notion_prop_priority: str = ""
     notion_prop_last_reminded: str = ""
