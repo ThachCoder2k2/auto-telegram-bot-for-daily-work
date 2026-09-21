@@ -54,6 +54,9 @@ ERROR_SLEEP_SECONDS = 15
 
 # Remembers which batch the last AI-written nudge covered.
 NUDGE_FINGERPRINT_META_KEY = "notion_nudge_fingerprint"
+# The clock hour the reminder check last ran in, so nudges land on the hour
+# and a restart cannot fire a second time inside the same hour.
+HOUR_SLOT_META_KEY = "notion_reminder_hour_slot"
 
 
 def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
@@ -66,10 +69,16 @@ def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
 
     store = StateStore(settings.state_db_path)
     offset = _load_offset(settings, store)
+    # Claim the current hour without acting on it, so a deploy at 21:52 does
+    # not fire an off-hour nudge. The first one lands at the next HH:00.
+    if not store.get_meta(HOUR_SLOT_META_KEY, ""):
+        store.set_meta(
+            HOUR_SLOT_META_KEY,
+            datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%dT%H"),
+        )
     _LOG.info("command loop up (offset=%d)", offset)
 
     cycles = 0
-    last_reminder_check = 0.0
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
         try:
@@ -85,18 +94,33 @@ def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
                 offset = next_offset
                 store.set_meta(OFFSET_META_KEY, str(offset))
 
-            # The poll already wakes every ~30s, so reminders ride along on
-            # this loop instead of needing a second scheduler.
-            if (
-                time.monotonic() - last_reminder_check
-                >= settings.notion_reminder_check_seconds
-            ):
-                last_reminder_check = time.monotonic()
+            # Reminders ride this loop rather than needing a second
+            # scheduler. The poll wakes every ~30s, so checking on the hour
+            # lands a nudge within seconds of HH:00.
+            if _hour_slot_turned(settings, store):
                 send_due_reminders(settings, store)
                 send_due_note_alerts(settings, store)
         except Exception as exc:  # noqa: BLE001 - the loop must outlive failures
             _LOG.exception("command loop error: %s", type(exc).__name__)
             time.sleep(ERROR_SLEEP_SECONDS)
+
+
+def _hour_slot_turned(settings: Settings, store: StateStore) -> bool:
+    """True once per clock hour.
+
+    Anchoring to the clock rather than to "an hour since the last nudge" is
+    what keeps nudges landing at 20:00 and 21:00 instead of drifting to
+    whatever minute the previous one happened to fire — which, after a few
+    restarts, had scattered them across :02 and :04.
+
+    The slot is persisted so a restart mid-hour does not fire a second time.
+    """
+    now = datetime.now(ZoneInfo(settings.timezone))
+    slot = now.strftime("%Y-%m-%dT%H")
+    if store.get_meta(HOUR_SLOT_META_KEY, "") == slot:
+        return False
+    store.set_meta(HOUR_SLOT_META_KEY, slot)
+    return True
 
 
 def send_due_reminders(settings: Settings, store: StateStore) -> int:

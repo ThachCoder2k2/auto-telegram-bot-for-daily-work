@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 from datetime import datetime, timedelta, timezone
 
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from daily_intel_bot import notion_tasks
@@ -726,3 +728,70 @@ def test_notes_are_flagged_the_day_before_and_on_the_day():
     later = _note(days=2, page_id="c")
     flagged = notes_needing_alert([tomorrow, today_, later], NOW, 1)
     assert {e.page_id for e in flagged} == {"a", "b"}
+
+
+def test_reminder_check_runs_once_per_clock_hour(settings, monkeypatch):
+    """Nudges must land at 20:00 and 21:00, not drift to :35 forever."""
+    import daily_intel_bot.poller as poller_module
+
+    store = StateStore(settings.state_db_path)
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    clock = {"now": datetime(2026, 9, 21, 20, 0, 3, tzinfo=tz)}
+    monkeypatch.setattr(
+        poller_module, "datetime", _FrozenClock(clock)
+    )
+
+    assert poller_module._hour_slot_turned(settings, store) is True
+    # Later in the same hour: already handled.
+    clock["now"] = datetime(2026, 9, 21, 20, 47, tzinfo=tz)
+    assert poller_module._hour_slot_turned(settings, store) is False
+    # The hour turns over.
+    clock["now"] = datetime(2026, 9, 21, 21, 0, 2, tzinfo=tz)
+    assert poller_module._hour_slot_turned(settings, store) is True
+
+
+def test_a_restart_mid_hour_does_not_fire_a_second_nudge(settings, monkeypatch):
+    import daily_intel_bot.poller as poller_module
+
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    clock = {"now": datetime(2026, 9, 21, 21, 0, 1, tzinfo=tz)}
+    monkeypatch.setattr(poller_module, "datetime", _FrozenClock(clock))
+
+    store = StateStore(settings.state_db_path)
+    assert poller_module._hour_slot_turned(settings, store) is True
+    # Container restarts at 21:34; a fresh store reads the persisted slot.
+    clock["now"] = datetime(2026, 9, 21, 21, 34, tzinfo=tz)
+    restarted = StateStore(settings.state_db_path)
+    assert poller_module._hour_slot_turned(settings, restarted) is False
+
+
+class _FrozenClock:
+    """Stands in for ``datetime`` so only ``now()`` is controlled."""
+
+    def __init__(self, holder):
+        self._holder = holder
+
+    def now(self, tz=None):
+        return self._holder["now"]
+
+
+def test_a_deploy_mid_hour_waits_for_the_next_hour(settings, monkeypatch):
+    """Restarting at 21:52 must not fire an off-hour nudge."""
+    import daily_intel_bot.poller as poller_module
+
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    clock = {"now": datetime(2026, 9, 21, 21, 52, tzinfo=tz)}
+    monkeypatch.setattr(poller_module, "datetime", _FrozenClock(clock))
+    monkeypatch.setattr(
+        poller_module, "fetch_updates", lambda *a, **k: ([], 0)
+    )
+    fired = []
+    monkeypatch.setattr(
+        poller_module, "send_due_reminders", lambda *a: fired.append("nudge")
+    )
+    monkeypatch.setattr(poller_module, "send_due_note_alerts", lambda *a: None)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "555")
+
+    poller_module.run_command_loop(Settings(), max_cycles=1)
+    assert fired == []
