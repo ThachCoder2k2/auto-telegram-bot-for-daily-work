@@ -15,12 +15,18 @@ from zoneinfo import ZoneInfo
 from daily_intel_bot.commands import handle_command
 from daily_intel_bot.config import Settings
 from daily_intel_bot.delivery import send_daily_digest
-from daily_intel_bot.notion_tasks import load_board_quietly, stamp_reminded
+from daily_intel_bot.notion_tasks import (
+    load_board_quietly,
+    load_notes_quietly,
+    stamp_reminded,
+)
 from daily_intel_bot.obs import get_logger
 from daily_intel_bot.persona import select_persona
 from daily_intel_bot.reminders import (
     ReminderWindow,
     due_reminders,
+    notes_needing_alert,
+    render_note_alert,
     render_reminder_batch,
 )
 from daily_intel_bot.state_store import StateStore
@@ -75,6 +81,7 @@ def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
             ):
                 last_reminder_check = time.monotonic()
                 send_due_reminders(settings, store)
+                send_due_note_alerts(settings, store)
         except Exception as exc:  # noqa: BLE001 - the loop must outlive failures
             _LOG.exception("command loop error: %s", type(exc).__name__)
             time.sleep(ERROR_SLEEP_SECONDS)
@@ -137,6 +144,57 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         stamp_reminded(settings, board.schema, task.page_id, now)
     _LOG.info("sent 1 batched nudge covering %d Notion task(s)", len(due))
     return len(due)
+
+
+def send_due_note_alerts(settings: Settings, store: StateStore) -> int:
+    """Ping about dated entries as their date nears.
+
+    Deliberately rare: a meeting or deadline does not decay by being ignored
+    the way an open task does, so pinging hourly would be pure noise. At most
+    one ping per entry per day, and only inside the alert window.
+    """
+    entries = load_notes_quietly(settings, store)
+    if not entries:
+        return 0
+
+    now = datetime.now(ZoneInfo(settings.timezone))
+    window = ReminderWindow(
+        start_hour=settings.notion_quiet_start,
+        end_hour=settings.notion_quiet_end,
+    )
+    if not window.is_open(now):
+        return 0
+
+    today = now.date().isoformat()
+    fresh = [
+        entry
+        for entry in notes_needing_alert(entries, now, settings.notion_notes_alert_days)
+        if store.get_meta(_note_alert_key(entry.page_id), "") != today
+    ]
+    if not fresh:
+        return 0
+
+    persona = select_persona(
+        enabled=settings.bot_persona_enabled,
+        rotation=settings.bot_persona_rotation,
+        pool=settings.bot_persona_pool,
+        forced_key=settings.bot_persona_force,
+        now=now,
+    )
+    try:
+        send_message(settings, render_note_alert(fresh, now, persona))
+    except Exception as exc:  # noqa: BLE001 - retried on the next check
+        _LOG.warning("note alert failed: %s: %s", type(exc).__name__, exc)
+        return 0
+
+    for entry in fresh:
+        store.set_meta(_note_alert_key(entry.page_id), today)
+    _LOG.info("sent note alert covering %d dated entry(ies)", len(fresh))
+    return len(fresh)
+
+
+def _note_alert_key(page_id: str) -> str:
+    return f"notion_note_alert:{page_id}"
 
 
 def _dispatch(settings: Settings, text: str) -> None:

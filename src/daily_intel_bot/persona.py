@@ -23,8 +23,13 @@ class PersonaProfile:
     # Reminder voice. ``nag_line`` takes over once a task has been nudged
     # repeatedly without moving, so the bot escalates instead of repeating
     # itself word for word every hour.
-    reminder_line: str = "Việc đang đợi bạn."
-    nag_line: str = "Việc này nhắc mãi mà vẫn nằm im."
+    reminder_line: str = "This is still waiting on you."
+    nag_line: str = "This keeps coming back untouched."
+    # Dated entries are not chores; nothing rots, the date simply arrives.
+    # The voice is a heads-up, not a scolding.
+    note_today_line: str = "This one lands today."
+    note_soon_line: str = "This one lands tomorrow."
+    note_ahead_line: str = "Something is coming up."
 
 
 PERSONA_PROFILES: dict[str, PersonaProfile] = {
@@ -50,6 +55,9 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         closing_line="I will remember what remains unfinished, Master.",
         reminder_line="Master, you left something untouched. Shall I keep it warm for you?",
         nag_line="You keep walking past this one, Master. I am starting to enjoy watching you avoid it.",
+        note_today_line="Today is the day, Master. Do not let it slip past you.",
+        note_soon_line="Tomorrow, Master. I thought you would want to know before it arrives.",
+        note_ahead_line="A date approaches, Master. I am keeping it warm for you.",
     ),
     "milf_teacher": PersonaProfile(
         key="milf_teacher",
@@ -73,6 +81,9 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         closing_line="Homework remains recorded. Do not waste tomorrow.",
         reminder_line="Student. This is still open. Fifteen minutes now beats an hour later.",
         nag_line="Student, I have asked repeatedly. Either do it, resize it, or drop it — but stop pretending.",
+        note_today_line="Today, Student. Deadlines do not negotiate.",
+        note_soon_line="Tomorrow, Student. Prepare tonight, not in the morning.",
+        note_ahead_line="Mark this on your calendar now, Student, while there is still time.",
     ),
     "soft_girlfriend": PersonaProfile(
         key="soft_girlfriend",
@@ -96,6 +107,9 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         closing_line="I saved the thread so we can continue tomorrow, babe.",
         reminder_line="Hey babe, this one is still waiting. No pressure, just a nudge.",
         nag_line="Babe, this has been sitting a while. Is it stuck, or is it just too big to start?",
+        note_today_line="Babe, this is today. Just a heads-up so it does not surprise you.",
+        note_soon_line="Tomorrow, babe. Nothing to do yet, just so you know.",
+        note_ahead_line="Something is on the calendar soon, babe. Plenty of time still.",
     ),
     "rot_maiden": PersonaProfile(
         key="rot_maiden",
@@ -119,6 +133,9 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         closing_line="The unfinished oath is sealed until tomorrow.",
         reminder_line="An oath remains unfulfilled, my lord. The hour is still yours.",
         nag_line="This oath rots, my lord. Each hour it sits, it grows heavier to lift.",
+        note_today_line="The appointed day is here, my lord.",
+        note_soon_line="The appointed day comes with the next dawn, my lord.",
+        note_ahead_line="A date waits on the road ahead, my lord. Walk toward it knowingly.",
     ),
     "final_boss_queen": PersonaProfile(
         key="final_boss_queen",
@@ -142,6 +159,9 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         closing_line="Your remaining weakness has been recorded.",
         reminder_line="Still undone, little challenger. Prove me wrong before the hour turns.",
         nag_line="How many times must I repeat myself? This one is beginning to define you.",
+        note_today_line="Today, little challenger. I trust you did not forget.",
+        note_soon_line="Tomorrow. Consider this the only warning you get.",
+        note_ahead_line="A date approaches. I expect you to be ready before I have to remind you again.",
     ),
 }
 

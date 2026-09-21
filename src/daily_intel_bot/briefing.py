@@ -29,10 +29,18 @@ from daily_intel_bot.gemini_client import (
     generate_ai_briefing_sections_gemini,
     generate_item_takes_gemini,
 )
-from daily_intel_bot.notion_tasks import load_board_quietly, remember_task_order
+from daily_intel_bot.notion_tasks import (
+    load_board_quietly,
+    load_notes_quietly,
+    remember_task_order,
+)
 from daily_intel_bot.obs import get_logger, is_transient_http_error, with_retries
 from daily_intel_bot.persona import PersonaProfile, persona_intro, select_persona
-from daily_intel_bot.reminders import render_task_line
+from daily_intel_bot.reminders import (
+    render_note_line,
+    render_task_line,
+    upcoming_notes,
+)
 from daily_intel_bot.state_store import StateStore, current_streak
 from daily_intel_bot.tavily_client import TavilySearchSpec, search_tavily
 
@@ -429,6 +437,7 @@ def render_daily_briefing(
             f"{weekly.get('dropped', 0)} dropped"
         )
     lines.extend(_render_notion_block(settings, store))
+    lines.extend(_render_notes_block(settings, store, now))
     lines.append(
         "❓ <b>Reply:</b> <code>/done</code> · <code>/blocked why</code> · "
         "<code>/task new thing</code> · <code>/help</code>"
@@ -527,11 +536,29 @@ def _render_notion_block(settings: Settings, store: StateStore) -> list[str]:
     shown = board.tasks[: settings.notion_task_limit]
     # Remember the numbering so /ndone <n> still resolves tomorrow.
     remember_task_order(store, shown)
-    lines = ["", f"📥 <b>Notion — {len(board.tasks)} việc chưa xong</b>"]
+    lines = ["", f"📥 <b>Notion — {len(board.tasks)} open</b>"]
     lines.extend(render_task_line(index, task) for index, task in enumerate(shown, 1))
     if len(board.tasks) > len(shown):
-        lines.append(f"   <i>+{len(board.tasks) - len(shown)} việc nữa</i>")
-    lines.append("   <i>Xong việc nào: <code>/ndone &lt;số&gt;</code></i>")
+        lines.append(f"   <i>+{len(board.tasks) - len(shown)} more</i>")
+    lines.append("   <i>Tick one off with <code>/ndone &lt;n&gt;</code></i>")
+    return lines
+
+
+def _render_notes_block(settings: Settings, store: StateStore, now: datetime) -> list[str]:
+    """Dated entries, shown once a day in the brief.
+
+    This is the 'occasionally' surface for things that are not chores: the
+    brief already runs daily, so nothing extra has to be scheduled for a note
+    that is still a week out.
+    """
+    entries = load_notes_quietly(settings, store)
+    if not entries:
+        return []
+    upcoming = upcoming_notes(entries, now, settings.notion_notes_lookahead_days)
+    if not upcoming:
+        return []
+    lines = ["", f"🗓️ <b>Coming up — next {settings.notion_notes_lookahead_days} days</b>"]
+    lines.extend(render_note_line(entry, now) for entry in upcoming)
     return lines
 
 

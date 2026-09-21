@@ -363,7 +363,10 @@ def _review_word(settings: Settings, argument: str, correct: bool) -> CommandRes
 def _cmd_ntasks(settings: Settings, argument: str) -> CommandResult:
     if not notion_tasks.is_configured(settings):
         return CommandResult(
-            reply="🔌 Notion chưa bật. Đặt NOTION_ENABLED, NOTION_TOKEN, NOTION_DATABASE_ID."
+            reply=(
+                "🔌 Notion is off. Set NOTION_ENABLED, NOTION_TOKEN "
+                "and NOTION_DATABASE_ID."
+            )
         )
     store = StateStore(settings.state_db_path)
     try:
@@ -372,36 +375,36 @@ def _cmd_ntasks(settings: Settings, argument: str) -> CommandResult:
         return CommandResult(reply=f"📛 Notion: {escape(str(exc))}")
 
     if not board.tasks:
-        return CommandResult(reply="🎉 Notion sạch — không còn việc nào chưa xong.")
+        return CommandResult(reply="🎉 Board is clear — nothing open.")
 
     shown = board.tasks[: settings.notion_task_limit]
     # Persist the order so /ndone <n> still resolves after this message
     # scrolls out of view.
     notion_tasks.remember_task_order(store, shown)
-    lines = [f"📥 <b>Notion — {len(board.tasks)} việc chưa xong</b>", ""]
+    lines = [f"📥 <b>Notion — {len(board.tasks)} open</b>", ""]
     lines.extend(render_task_line(index, task) for index, task in enumerate(shown, 1))
     if len(board.tasks) > len(shown):
-        lines.append(f"<i>+{len(board.tasks) - len(shown)} việc nữa</i>")
+        lines.append(f"<i>+{len(board.tasks) - len(shown)} more</i>")
     lines.append("")
-    lines.append("Xong việc nào: <code>/ndone &lt;số&gt;</code>")
+    lines.append("Tick one off with <code>/ndone &lt;n&gt;</code>")
     return CommandResult(reply="\n".join(lines))
 
 
 def _cmd_ndone(settings: Settings, argument: str) -> CommandResult:
     if not notion_tasks.is_configured(settings):
-        return CommandResult(reply="🔌 Notion chưa bật.")
+        return CommandResult(reply="🔌 Notion is off.")
     try:
         number = int(argument.strip())
     except (TypeError, ValueError):
         return CommandResult(
-            reply="✍️ Dùng: <code>/ndone 2</code> (số lấy từ /ntasks)"
+            reply="✍️ Usage: <code>/ndone 2</code> — the number comes from /ntasks"
         )
 
     store = StateStore(settings.state_db_path)
     page_id = notion_tasks.resolve_task_number(store, number)
     if not page_id:
         return CommandResult(
-            reply=f"🤷 Không có việc số {number}. Chạy /ntasks để lấy danh sách mới."
+            reply=f"🤷 No task #{number}. Run /ntasks for a fresh list."
         )
     try:
         board = notion_tasks.load_board(settings, store)
@@ -411,10 +414,10 @@ def _cmd_ndone(settings: Settings, argument: str) -> CommandResult:
 
     title = next(
         (task.title for task in board.tasks if task.page_id == page_id),
-        f"việc #{number}",
+        f"task #{number}",
     )
     return CommandResult(
-        reply=f"✅ Đã tick <b>{escape(title)}</b> sang Done trong Notion."
+        reply=f"✅ Marked <b>{escape(title)}</b> as Done in Notion."
     )
 
 

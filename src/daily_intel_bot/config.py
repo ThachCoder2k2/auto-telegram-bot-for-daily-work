@@ -102,6 +102,14 @@ class Settings(BaseSettings):
     # board offers is hourly, so checking more often only burns API calls.
     notion_reminder_check_seconds: int = 3600
     # Overrides for when schema auto-detection picks the wrong column.
+    # --- Notion dated notes / meetings ---
+    # A second board whose rows carry a date. Unlike tasks, nothing here rots
+    # by being left alone — the date simply arrives — so it is surfaced in the
+    # daily brief and pinged at most once a day, only as the date nears.
+    notion_notes_enabled: bool = False
+    notion_notes_database_id: str = ""
+    notion_notes_lookahead_days: int = 14
+    notion_notes_alert_days: int = 3
     notion_prop_status: str = ""
     notion_prop_priority: str = ""
     notion_prop_last_reminded: str = ""

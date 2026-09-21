@@ -29,6 +29,8 @@ NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2026-03-11"
 DATA_SOURCE_META_KEY = "notion_data_source_id"
 REQUEST_TIMEOUT_SECONDS = 25
+# An edit landing this close to our own Last Reminded stamp was made by us.
+BOT_EDIT_WINDOW_SECONDS = 120
 
 
 class NotionError(RuntimeError):
@@ -70,13 +72,31 @@ class NotionTask:
     def is_done(self) -> bool:
         return self.status.strip().lower() == "done"
 
-    def idle_days(self, now: datetime) -> int | None:
-        """Days since anyone last edited the task."""
+    def user_edited_at(self) -> datetime | None:
+        """When a human last touched the task, ignoring our own writes.
+
+        Stamping ``Last Reminded`` bumps Notion's ``last_edited_time``, so
+        reading that field naively makes every reminded task look freshly
+        worked on — the reminder erases the very staleness it is meant to
+        report. An edit within a couple of minutes of our stamp is ours.
+        """
         if self.edited_at is None:
             return None
-        return max(0, (now - self.edited_at).days)
+        if self.last_reminded is not None:
+            delta = abs((self.edited_at - self.last_reminded).total_seconds())
+            if delta <= BOT_EDIT_WINDOW_SECONDS:
+                return None
+        return self.edited_at
+
+    def idle_days(self, now: datetime) -> int | None:
+        """Days since a human last touched the task, if that is knowable."""
+        edited = self.user_edited_at()
+        if edited is None:
+            return None
+        return max(0, (now - edited).days)
 
     def age_days(self, now: datetime) -> int | None:
+        """Days since the task was created. Notion never rewrites this."""
         if self.created_at is None:
             return None
         return max(0, (now - self.created_at).days)
@@ -312,6 +332,118 @@ def _parse_task(page: dict, schema: NotionSchema) -> NotionTask:
         url=str(page.get("url") or ""),
         created_at=timestamp("created_time"),
         edited_at=timestamp("last_edited_time"),
+    )
+
+
+# --- dated notes / meetings ------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class NotesSchema:
+    title: str
+    date: str = ""
+    attendees: str = ""
+    notes: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class NoteEntry:
+    page_id: str
+    title: str
+    date: datetime | None
+    attendees: tuple[str, ...]
+    notes: str
+    url: str
+
+    def days_until(self, now: datetime) -> int | None:
+        if self.date is None:
+            return None
+        return (self.date.date() - now.date()).days
+
+
+def detect_notes_schema(properties: dict) -> NotesSchema:
+    by_type: dict[str, list[str]] = {}
+    for name, spec in properties.items():
+        by_type.setdefault(str(spec.get("type")), []).append(name)
+    rich = by_type.get("rich_text") or []
+    return NotesSchema(
+        title=(by_type.get("title") or [""])[0],
+        date=(by_type.get("date") or [""])[0],
+        attendees=(by_type.get("people") or [""])[0],
+        # Prefer a column actually called notes over the first rich_text field.
+        notes=next((name for name in rich if "note" in name.lower()), rich[0] if rich else ""),
+    )
+
+
+def fetch_database(settings: Settings, database_id: str) -> dict:
+    return _call(settings, f"/databases/{parse.quote(database_id.strip())}")
+
+
+def fetch_notes_schema(settings: Settings, data_source_id: str) -> NotesSchema:
+    payload = _call(settings, f"/data_sources/{parse.quote(data_source_id)}")
+    return detect_notes_schema(payload.get("properties") or {})
+
+
+def fetch_notes(
+    settings: Settings,
+    data_source_id: str,
+    schema: NotesSchema,
+    page_size: int = 50,
+) -> list[NoteEntry]:
+    """Read dated entries, soonest first."""
+    body: dict[str, object] = {"page_size": min(max(page_size, 1), 100)}
+    if schema.date:
+        body["sorts"] = [{"property": schema.date, "direction": "ascending"}]
+    payload = _call(
+        settings,
+        f"/data_sources/{parse.quote(data_source_id)}/query",
+        body=body,
+        method="POST",
+    )
+    entries = [
+        _parse_note(page, schema)
+        for page in payload.get("results", [])
+        if isinstance(page, dict)
+    ]
+    return [entry for entry in entries if entry.title]
+
+
+def _parse_note(page: dict, schema: NotesSchema) -> NoteEntry:
+    props = page.get("properties") or {}
+
+    def plain(name: str) -> str:
+        spec = props.get(name) or {}
+        kind = spec.get("type")
+        if kind in ("title", "rich_text"):
+            return "".join(
+                part.get("plain_text", "") for part in spec.get(kind, [])
+            ).strip()
+        return ""
+
+    when: datetime | None = None
+    spec = props.get(schema.date) or {}
+    raw = (spec.get("date") or {}).get("start") if spec.get("type") == "date" else None
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            when = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            when = None
+
+    people_spec = props.get(schema.attendees) or {}
+    attendees = tuple(
+        str(person.get("name") or "").strip()
+        for person in people_spec.get("people", [])
+        if isinstance(person, dict) and person.get("name")
+    )
+
+    return NoteEntry(
+        page_id=str(page.get("id") or ""),
+        title=plain(schema.title),
+        date=when,
+        attendees=attendees,
+        notes=plain(schema.notes) if schema.notes else "",
+        url=str(page.get("url") or ""),
     )
 
 

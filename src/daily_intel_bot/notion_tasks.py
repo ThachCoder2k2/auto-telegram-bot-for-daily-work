@@ -13,9 +13,13 @@ import json
 
 from daily_intel_bot.config import Settings
 from daily_intel_bot.notion_client import (
+    NoteEntry,
     NotionError,
     NotionSchema,
     NotionTask,
+    fetch_database,
+    fetch_notes,
+    fetch_notes_schema,
     fetch_schema,
     fetch_tasks,
     mark_task_done,
@@ -69,6 +73,43 @@ def load_board_quietly(settings: Settings, store: StateStore) -> Board | None:
     except NotionError as exc:
         _LOG.warning("Notion unavailable, skipping task block: %s", exc)
         return None
+
+
+NOTES_DATA_SOURCE_META_KEY = "notion_notes_data_source_id"
+
+
+def notes_configured(settings: Settings) -> bool:
+    return bool(
+        settings.notion_enabled
+        and settings.notion_token
+        and settings.notion_notes_enabled
+        and settings.notion_notes_database_id
+    )
+
+
+def load_notes(settings: Settings, store: StateStore) -> list[NoteEntry]:
+    """Read the dated notes board."""
+    data_source_id = store.get_meta(NOTES_DATA_SOURCE_META_KEY, "")
+    if not data_source_id:
+        payload = fetch_database(settings, settings.notion_notes_database_id)
+        sources = payload.get("data_sources") or []
+        if not sources:
+            raise NotionError("notes database returned no data_sources")
+        data_source_id = str(sources[0].get("id") or "")
+        store.set_meta(NOTES_DATA_SOURCE_META_KEY, data_source_id)
+
+    schema = fetch_notes_schema(settings, data_source_id)
+    return fetch_notes(settings, data_source_id, schema)
+
+
+def load_notes_quietly(settings: Settings, store: StateStore) -> list[NoteEntry]:
+    if not notes_configured(settings):
+        return []
+    try:
+        return load_notes(settings, store)
+    except NotionError as exc:
+        _LOG.warning("Notion notes unavailable: %s", exc)
+        return []
 
 
 def remember_task_order(store: StateStore, tasks: list[NotionTask]) -> None:

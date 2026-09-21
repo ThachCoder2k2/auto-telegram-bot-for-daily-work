@@ -9,13 +9,24 @@ import pytest
 
 from daily_intel_bot import notion_tasks
 from daily_intel_bot.config import Settings
-from daily_intel_bot.notion_client import NotionSchema, NotionTask, _parse_task, detect_schema
+from daily_intel_bot.notion_client import (
+    NoteEntry,
+    NotionSchema,
+    NotionTask,
+    _parse_task,
+    detect_notes_schema,
+    detect_schema,
+)
 from daily_intel_bot.persona import PERSONA_PROFILES
 from daily_intel_bot.reminders import (
     NAG_THRESHOLD,
     ReminderWindow,
     describe_gaps,
     due_reminders,
+    notes_needing_alert,
+    render_note_alert,
+    render_note_line,
+    upcoming_notes,
     render_reminder_batch,
     sort_tasks,
 )
@@ -369,7 +380,7 @@ def test_batch_is_one_message_not_one_per_task():
         assert f"{number}. " in rendered
     # The call-to-action and framing appear once, not once per task.
     assert rendered.count("/ntasks") == 1
-    assert rendered.count("Nhắc việc") == 1
+    assert rendered.count("Still open") == 1
 
 
 def test_persona_voice_is_used():
@@ -389,19 +400,26 @@ def test_tone_escalates_once_a_task_is_being_dodged():
     assert persona.nag_line not in calm
 
 
-def test_per_task_line_carries_effort_idleness_and_count():
-    task = _task("Nâng cấp uploader", page_id="p1", estimated="1 hour")
-    task = _replace_idle(task, days=6)
+def test_per_task_line_carries_effort_age_and_count():
+    task = _replace_idle(
+        _task("Nâng cấp uploader", page_id="p1", estimated="1 hour"), days=6
+    )
     rendered = render_reminder_batch([task], NOW, None, {"p1": 4})
     assert "1 hour" in rendered
-    assert "nằm im 6 ngày" in rendered
-    assert "nhắc lần 4" in rendered
+    assert "open 7d" in rendered
+    assert "nudge #4" in rendered
 
 
-def test_missing_estimate_is_named_rather_than_omitted():
-    """Silence about a missing field is what made the old nudge useless."""
-    rendered = render_reminder_batch([_task(page_id="p1")], NOW, None, {})
-    assert "chưa ước lượng" in rendered
+def test_a_task_with_nothing_to_report_gets_no_detail_line():
+    """Three tasks printing three identical grey lines is noise, not detail."""
+    fresh = dataclasses.replace(
+        _task("Just made", page_id="p1"),
+        created_at=NOW,
+        edited_at=NOW,
+    )
+    rendered = render_reminder_batch([fresh], NOW, None, {"p1": 1})
+    assert "Just made" in rendered
+    assert "<i>" not in rendered.split("Just made", 1)[1].split("⚠️")[0]
 
 
 # --- gap analysis ---------------------------------------------------------
@@ -410,13 +428,13 @@ def test_missing_estimate_is_named_rather_than_omitted():
 def test_gaps_flag_a_stalled_task():
     stalled = _replace_idle(_task("Nâng cấp uploader", page_id="p1"), days=6)
     gaps = describe_gaps([stalled], NOW, {})
-    assert any("6 ngày" in gap and "Nâng cấp uploader" in gap for gap in gaps)
+    assert any("7 days" in gap and "Nâng cấp uploader" in gap for gap in gaps)
 
 
 def test_gaps_flag_a_task_being_dodged():
     task = _replace_idle(_task("Dodged", page_id="p1"), days=0)
     gaps = describe_gaps([task], NOW, {"p1": 5})
-    assert any("5 lần" in gap for gap in gaps)
+    assert any("5 times" in gap for gap in gaps)
 
 
 def test_gaps_count_missing_priority_and_estimate():
@@ -426,17 +444,57 @@ def test_gaps_count_missing_priority_and_estimate():
         _task("c", page_id="c"),
     ]
     gaps = describe_gaps(tasks, NOW, {})
-    assert any("2 việc chưa đặt Priority" in gap for gap in gaps)
-    assert any("2 việc chưa có Estimated Time" in gap for gap in gaps)
+    assert any("2 tasks have no Priority" in gap for gap in gaps)
+    assert any("2 tasks have no Estimated Time" in gap for gap in gaps)
 
 
 def test_a_healthy_board_reports_no_gaps():
     tasks = [
-        _replace_idle(
-            _task("a", page_id="a", priority="High", estimated="1 hour"), days=0
+        dataclasses.replace(
+            _task("a", page_id="a", priority="High", estimated="1 hour"),
+            created_at=NOW,
+            edited_at=NOW,
         )
     ]
     assert describe_gaps(tasks, NOW, {"a": 1}) == []
+
+
+def test_a_single_task_is_not_nagged_about_priority():
+    """With one task there is nothing to order, so Priority is not yet needed."""
+    only = dataclasses.replace(
+        _task("a", page_id="a", estimated="1 hour"), created_at=NOW, edited_at=NOW
+    )
+    assert describe_gaps([only], NOW, {}) == []
+
+
+def test_our_own_reminder_stamp_is_not_mistaken_for_progress():
+    """Stamping Last Reminded bumps last_edited_time.
+
+    Read naively that makes every reminded task look freshly worked on, so
+    the reminder would erase the staleness it exists to report.
+    """
+    stamped = dataclasses.replace(
+        _task("a", page_id="a"),
+        created_at=NOW - timedelta(days=30),
+        edited_at=NOW,
+        last_reminded=NOW,
+    )
+    assert stamped.user_edited_at() is None
+    assert stamped.idle_days(NOW) is None
+    # Age still works: Notion never rewrites created_time.
+    assert stamped.age_days(NOW) == 30
+    assert any("30 days" in gap for gap in describe_gaps([stamped], NOW, {}))
+
+
+def test_a_genuine_user_edit_is_still_seen():
+    edited = dataclasses.replace(
+        _task("a", page_id="a"),
+        created_at=NOW - timedelta(days=30),
+        edited_at=NOW - timedelta(days=4),
+        last_reminded=NOW,
+    )
+    assert edited.user_edited_at() is not None
+    assert edited.idle_days(NOW) == 4
 
 
 def test_in_progress_stale_task_is_not_called_unstarted():
@@ -445,7 +503,7 @@ def test_in_progress_stale_task_is_not_called_unstarted():
         _task("a", page_id="a", status="In Progress"), days=9
     )
     gaps = describe_gaps([task], NOW, {})
-    assert not any("Chưa bắt đầu" in gap for gap in gaps)
+    assert not any("Not Started" in gap for gap in gaps)
 
 
 # --- task numbering -------------------------------------------------------
@@ -496,3 +554,79 @@ def test_disabled_notion_is_skipped_without_network(tmp_path, monkeypatch):
     settings = Settings()
     assert not notion_tasks.is_configured(settings)
     assert notion_tasks.load_board_quietly(settings, StateStore(settings.state_db_path)) is None
+
+
+# --- dated notes ----------------------------------------------------------
+
+
+def _note(title="Cancel sub", days=None, attendees=(), notes="", page_id="n1"):
+    return NoteEntry(
+        page_id=page_id,
+        title=title,
+        date=None if days is None else NOW + timedelta(days=days),
+        attendees=tuple(attendees),
+        notes=notes,
+        url="https://notion.so/n1",
+    )
+
+
+def test_detects_the_live_notes_board():
+    schema = detect_notes_schema(
+        {
+            "Created by": {"type": "created_by"},
+            "Notes": {"type": "rich_text"},
+            "Date": {"type": "date"},
+            "Attendees": {"type": "people"},
+            "Name": {"type": "title"},
+        }
+    )
+    assert schema.title == "Name"
+    assert schema.date == "Date"
+    assert schema.attendees == "Attendees"
+    assert schema.notes == "Notes"
+
+
+def test_upcoming_notes_window_excludes_the_past_and_the_far_future():
+    entries = [
+        _note("yesterday", days=-1, page_id="a"),
+        _note("today", days=0, page_id="b"),
+        _note("next week", days=6, page_id="c"),
+        _note("next year", days=300, page_id="d"),
+        _note("undated", days=None, page_id="e"),
+    ]
+    titles = [e.title for e in upcoming_notes(entries, NOW, 14)]
+    assert titles == ["today", "next week"]
+
+
+def test_alerts_only_fire_as_the_date_nears():
+    """A date six days out does not need a ping; it needs a calendar."""
+    far = _note(days=6)
+    near = _note(days=2, page_id="n2")
+    assert notes_needing_alert([far], NOW, 3) == []
+    assert notes_needing_alert([near], NOW, 3) == [near]
+
+
+def test_note_voice_matches_how_close_the_date_is():
+    persona = PERSONA_PROFILES["milf_teacher"]
+    today = render_note_alert([_note(days=0)], NOW, persona)
+    tomorrow = render_note_alert([_note(days=1)], NOW, persona)
+    later = render_note_alert([_note(days=3)], NOW, persona)
+    assert persona.note_today_line in today
+    assert persona.note_soon_line in tomorrow
+    assert persona.note_ahead_line in later
+
+
+def test_note_line_says_when_in_plain_words():
+    assert "today" in render_note_line(_note(days=0), NOW)
+    assert "tomorrow" in render_note_line(_note(days=1), NOW)
+    assert "in 5 days" in render_note_line(_note(days=5), NOW)
+
+
+def test_note_line_lists_attendees_when_present():
+    rendered = render_note_line(_note(days=1, attendees=("Tuấn", "Thạch")), NOW)
+    assert "with Tuấn, Thạch" in rendered
+
+
+def test_note_content_is_escaped():
+    rendered = render_note_line(_note(title="A & B <b>", days=1), NOW)
+    assert "A &amp; B &lt;b&gt;" in rendered

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
 
-from daily_intel_bot.notion_client import NotionTask
+from daily_intel_bot.notion_client import NoteEntry, NotionTask
 from daily_intel_bot.persona import PersonaProfile
 
 
@@ -185,7 +185,7 @@ def render_reminder_batch(
         lines.append(f"{persona.icon} <b>{escape(persona.name)}</b>")
         lines.append(f"<blockquote>{escape(voice)}</blockquote>")
     else:
-        lines.append("⏰ <b>Nhắc việc</b>" if not nagging else "⏰ <b>Vẫn chưa xong</b>")
+        lines.append("⏰ <b>Still open</b>" if not nagging else "⏰ <b>Still open. Again.</b>")
     lines.append("")
 
     for index, task in enumerate(tasks, start=1):
@@ -204,23 +204,37 @@ def render_reminder_batch(
         lines.extend(f"⚠️ <i>{escape(gap)}</i>" for gap in gaps)
 
     lines.append("")
-    lines.append("<code>/ndone &lt;số&gt;</code> khi xong · <code>/ntasks</code> xem tất cả")
+    lines.append(
+        "<code>/ndone &lt;n&gt;</code> when it's done · "
+        "<code>/ntasks</code> for the full board"
+    )
     return "\n".join(lines)
 
 
 def _task_signals(task: NotionTask, now: datetime, count: int) -> list[str]:
-    """The per-task facts worth the line: effort, idleness, nudge count."""
+    """Only what is specific to this task and not obvious from the title.
+
+    An earlier version printed a field for every task whether or not it said
+    anything, so three tasks rendered three identical grey lines. A detail
+    line now appears only when it carries news; otherwise the task is just a
+    title, which is enough.
+    """
     parts: list[str] = []
     if task.estimated_time:
         parts.append(task.estimated_time)
-    else:
-        parts.append("chưa ước lượng")
+
+    # Age comes from created_time, which Notion never rewrites, so it survives
+    # our own Last Reminded stamps. Only worth saying once it is old.
+    age = task.age_days(now)
+    if age is not None and age >= STALE_DAYS:
+        parts.append(f"open {age}d")
 
     idle = task.idle_days(now)
-    if idle is not None:
-        parts.append("chạm hôm nay" if idle == 0 else f"nằm im {idle} ngày")
+    if idle is not None and idle >= STALE_DAYS:
+        parts.append(f"last touched {idle}d ago")
+
     if count > 1:
-        parts.append(f"nhắc lần {count}")
+        parts.append(f"nudge #{count}")
     if task.status and task.status.strip().lower() != "not started":
         parts.append(task.status)
     return parts
@@ -239,17 +253,19 @@ def describe_gaps(
     """
     gaps: list[str] = []
 
+    # Age, not last-edit: our own reminder stamps keep bumping last-edit, so
+    # measuring staleness that way would report every task as fresh.
     stalled = [
         task
         for task in tasks
-        if (task.idle_days(now) or 0) >= STALE_DAYS
+        if (task.age_days(now) or 0) >= STALE_DAYS
         and task.status.strip().lower() == "not started"
     ]
     if stalled:
-        worst = max(stalled, key=lambda t: t.idle_days(now) or 0)
+        worst = max(stalled, key=lambda t: t.age_days(now) or 0)
         gaps.append(
-            f"Chưa bắt đầu {worst.idle_days(now)} ngày: {_short(worst.title)}"
-            + (f" (+{len(stalled) - 1} việc nữa)" if len(stalled) > 1 else "")
+            f"Open {worst.age_days(now)} days, still Not Started: {_short(worst.title)}"
+            + (f" (+{len(stalled) - 1} more)" if len(stalled) > 1 else "")
         )
 
     dodged = [
@@ -259,22 +275,122 @@ def describe_gaps(
         worst = max(dodged, key=lambda t: reminder_counts.get(t.page_id, 0))
         count = reminder_counts.get(worst.page_id, 0)
         gaps.append(
-            f"Nhắc {count} lần vẫn chưa động: {_short(worst.title)} "
-            "— chia nhỏ ra, hoặc /ndone nếu không còn cần"
+            f"Nudged {count} times, still untouched: {_short(worst.title)} "
+            "— split it smaller, or /ndone it if it no longer matters"
         )
 
     missing_priority = [task for task in tasks if not task.priority.strip()]
-    if missing_priority:
+    # With a single task there is nothing to order, so a missing Priority is
+    # not yet a problem worth a line.
+    if missing_priority and len(tasks) > 1:
+        scope = "All " if len(missing_priority) == len(tasks) else ""
         gaps.append(
-            f"{len(missing_priority)} việc chưa đặt Priority nên không biết làm cái nào trước"
+            f"{scope}{len(missing_priority)} tasks have no Priority "
+            "→ nothing tells you which to pick first"
         )
 
     missing_estimate = [task for task in tasks if not task.estimated_time.strip()]
     if missing_estimate:
+        scope = "All " if len(missing_estimate) == len(tasks) else ""
         gaps.append(
-            f"{len(missing_estimate)} việc chưa có Estimated Time nên không biết có nhét vừa hôm nay không"
+            f"{scope}{len(missing_estimate)} tasks have no Estimated Time "
+            "→ you can't tell what fits in today"
         )
     return gaps
+
+
+# Dated entries are not tasks: nothing rots by being left alone, the date
+# simply arrives. So they surface rarely, and only as the day approaches.
+NOTE_ALERT_DAYS = 3
+
+
+def upcoming_notes(
+    entries: list[NoteEntry],
+    now: datetime,
+    lookahead_days: int,
+) -> list[NoteEntry]:
+    """Dated entries from today up to ``lookahead_days`` out, soonest first."""
+    upcoming = [
+        entry
+        for entry in entries
+        if entry.days_until(now) is not None
+        and 0 <= (entry.days_until(now) or 0) <= lookahead_days
+    ]
+    return sorted(upcoming, key=lambda entry: entry.days_until(now) or 0)
+
+
+def notes_needing_alert(
+    entries: list[NoteEntry],
+    now: datetime,
+    alert_days: int = NOTE_ALERT_DAYS,
+) -> list[NoteEntry]:
+    """Entries close enough that a separate ping is warranted."""
+    return [
+        entry
+        for entry in upcoming_notes(entries, now, alert_days)
+        if (entry.days_until(now) or 0) <= alert_days
+    ]
+
+
+def describe_when(days: int) -> str:
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "tomorrow"
+    return f"in {days} days"
+
+
+def render_note_line(entry: NoteEntry, now: datetime) -> str:
+    days = entry.days_until(now)
+    title = escape(entry.title)
+    if entry.url:
+        title = f'<a href="{escape(entry.url)}">{title}</a>'
+    icon = "🔴" if days is not None and days <= 1 else "📅"
+    line = f"{icon} <b>{title}</b>"
+    bits: list[str] = []
+    if entry.date is not None:
+        bits.append(entry.date.strftime("%a %d %b"))
+    if days is not None:
+        bits.append(describe_when(days))
+    if entry.attendees:
+        bits.append("with " + ", ".join(entry.attendees))
+    if bits:
+        line += f"\n   <i>{escape(' · '.join(bits))}</i>"
+    if entry.notes:
+        line += f"\n   <i>{escape(_short(entry.notes, 90))}</i>"
+    return line
+
+
+def render_note_alert(
+    entries: list[NoteEntry],
+    now: datetime,
+    persona: PersonaProfile | None,
+) -> str:
+    """A rare, dated heads-up — distinct in tone from the task nagging."""
+    # Explicit None check: "days or 99" would read an entry due *today* as 99
+    # days out, because zero is falsy.
+    horizons = [
+        entry.days_until(now) for entry in entries if entry.days_until(now) is not None
+    ]
+    soonest = min(horizons) if horizons else 99
+    lines: list[str] = []
+    if persona:
+        lines.append(f"{persona.icon} <b>{escape(persona.name)}</b>")
+        lines.append(f"<blockquote>{escape(_note_voice(persona, soonest))}</blockquote>")
+    else:
+        lines.append("🗓️ <b>Coming up</b>")
+    lines.append("")
+    lines.extend(render_note_line(entry, now) for entry in entries)
+    return "\n".join(lines)
+
+
+def _note_voice(persona: PersonaProfile, days: int) -> str:
+    """Date-aware framing, so an entry due today does not sound like one a week out."""
+    if days <= 0:
+        return persona.note_today_line
+    if days == 1:
+        return persona.note_soon_line
+    return persona.note_ahead_line
 
 
 def _short(value: str, limit: int = 42) -> str:
