@@ -74,9 +74,36 @@ def with_retries(
             if not retryable:
                 raise
             if attempt < attempts:
-                time.sleep(backoff * attempt)
+                time.sleep(_delay_for(exc, backoff, attempt))
     assert last_exc is not None
     raise last_exc
+
+
+# A 429 is a quota, not a blip. Retrying it on the same rhythm as a 503 just
+# hammers an endpoint that has already said no.
+RATE_LIMIT_BACKOFF_SECONDS = 20.0
+MAX_RETRY_SLEEP_SECONDS = 60.0
+
+
+def _delay_for(exc: Exception, backoff: float, attempt: int) -> float:
+    """How long to wait before the next attempt.
+
+    Honours ``Retry-After`` when the server sends one, because guessing
+    against a published number is how a rate limit turns into a ban.
+    """
+    if isinstance(exc, HTTPError) and exc.code == 429:
+        retry_after = None
+        try:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        except AttributeError:
+            retry_after = None
+        if retry_after:
+            try:
+                return min(float(retry_after), MAX_RETRY_SLEEP_SECONDS)
+            except (TypeError, ValueError):
+                pass
+        return min(RATE_LIMIT_BACKOFF_SECONDS * attempt, MAX_RETRY_SLEEP_SECONDS)
+    return min(backoff * attempt, MAX_RETRY_SLEEP_SECONDS)
 
 
 def is_transient_http_error(exc: Exception) -> bool:

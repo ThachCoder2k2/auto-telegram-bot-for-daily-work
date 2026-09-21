@@ -99,9 +99,9 @@ def _cmd_done(settings: Settings, argument: str) -> CommandResult:
         return CommandResult(reply="📭 No pending task to close. Add one with /task.")
 
     finished = tasks[0]
-    store.record_task_event(finished, "done", argument)
+    store.record_task_event(finished, "done", argument, _now(settings))
     remaining = tasks[1:]
-    streak = current_streak(store.done_days(), _today(settings))
+    streak = current_streak(store.done_days(today=_today(settings)), _today(settings))
     save_briefing_state(
         settings,
         BriefingState(
@@ -137,7 +137,7 @@ def _cmd_blocked(settings: Settings, argument: str) -> CommandResult:
     state = load_briefing_state(settings)
     tasks = state.tasks_remaining
     current = tasks[0] if tasks else state.current_project_focus
-    store.record_task_event(current, "blocked", argument)
+    store.record_task_event(current, "blocked", argument, _now(settings))
     save_briefing_state(
         settings,
         BriefingState(
@@ -194,7 +194,7 @@ def _cmd_drop(settings: Settings, argument: str) -> CommandResult:
     if not tasks:
         return CommandResult(reply="📭 Nothing to drop.")
     dropped = tasks[0]
-    store.record_task_event(dropped, "dropped", argument)
+    store.record_task_event(dropped, "dropped", argument, _now(settings))
     save_briefing_state(
         settings,
         BriefingState(
@@ -239,7 +239,7 @@ def _cmd_note(settings: Settings, argument: str) -> CommandResult:
     state = load_briefing_state(settings)
     tasks = state.tasks_remaining
     current = tasks[0] if tasks else state.current_project_focus
-    store.record_task_event(current, "note", argument)
+    store.record_task_event(current, "note", argument, _now(settings))
     return CommandResult(reply=f"📝 Noted against <b>{escape(current)}</b>.")
 
 
@@ -428,8 +428,8 @@ def _cmd_status(settings: Settings, argument: str) -> CommandResult:
     store = StateStore(settings.state_db_path)
     state = load_briefing_state(settings)
     tasks = state.tasks_remaining
-    streak = current_streak(store.done_days(), _today(settings))
-    counts = store.task_event_counts(within_days=7)
+    streak = current_streak(store.done_days(today=_today(settings)), _today(settings))
+    counts = store.task_event_counts(within_days=7, today=_today(settings))
     total_vocab, mastered = store.vocabulary_stats()
     due = len(store.due_vocabulary(limit=99))
 
@@ -502,8 +502,12 @@ def _help_text() -> str:
     )
 
 
+def _now(settings: Settings) -> datetime:
+    return datetime.now(ZoneInfo(settings.timezone))
+
+
 def _today(settings: Settings):
-    return datetime.now(ZoneInfo(settings.timezone)).date()
+    return _now(settings).date()
 
 
 _HANDLERS = {

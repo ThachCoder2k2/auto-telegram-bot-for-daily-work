@@ -356,7 +356,7 @@ class StateStore:
         now: datetime | None = None,
     ) -> int:
         """Store today's words. Existing words keep their schedule."""
-        now = now or datetime.now(timezone.utc)
+        now = _as_utc(now or datetime.now(timezone.utc))
         due = (now + timedelta(days=LEITNER_INTERVALS_DAYS[0])).isoformat()
         payload = [
             (word.strip().lower(), meaning.strip(), example.strip(), now.isoformat(), due)
@@ -384,7 +384,7 @@ class StateStore:
         now: datetime | None = None,
     ) -> list[VocabEntry]:
         """Words whose Leitner interval has elapsed, oldest due first."""
-        now = now or datetime.now(timezone.utc)
+        now = _as_utc(now or datetime.now(timezone.utc))
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -415,7 +415,7 @@ class StateStore:
         now: datetime | None = None,
     ) -> VocabEntry | None:
         """Apply a review result and reschedule the word."""
-        now = now or datetime.now(timezone.utc)
+        now = _as_utc(now or datetime.now(timezone.utc))
         key = word.strip().lower()
         with self._connect() as conn:
             row = conn.execute(
@@ -471,8 +471,7 @@ class StateStore:
         now: datetime | None = None,
     ) -> int:
         """Log a nudge and return how many times this task has been nudged."""
-        now = now or datetime.now(timezone.utc)
-        stamp = now.isoformat()
+        stamp = _as_utc(now or datetime.now(timezone.utc)).isoformat()
         with self._connect() as conn:
             conn.execute(
                 """
@@ -514,21 +513,33 @@ class StateStore:
         now: datetime | None = None,
     ) -> None:
         now = now or datetime.now(timezone.utc)
+        # ``day`` is deliberately the caller's calendar day, not UTC's: a
+        # streak is about the user's days. Recording UTC meant a /done before
+        # 07:00 in UTC+7 landed on yesterday and broke the streak.
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO task_events (day, task, status, note, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (now.date().isoformat(), task, status, note, now.isoformat()),
+                (
+                    now.date().isoformat(),
+                    task,
+                    status,
+                    note,
+                    _as_utc(now).isoformat(),
+                ),
             )
             conn.commit()
 
-    def done_days(self, within_days: int = 30) -> set[str]:
-        """Distinct ISO dates that recorded at least one completed task."""
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=within_days)
-        ).date().isoformat()
+    def done_days(self, within_days: int = 30, today: date | None = None) -> set[str]:
+        """Distinct ISO dates that recorded at least one completed task.
+
+        ``today`` should be the user's local date so the window lines up with
+        the days stored by ``record_task_event``.
+        """
+        anchor = today or datetime.now(timezone.utc).date()
+        cutoff = (anchor - timedelta(days=within_days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -540,10 +551,13 @@ class StateStore:
             ).fetchall()
         return {row[0] for row in rows}
 
-    def task_event_counts(self, within_days: int = 7) -> dict[str, int]:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=within_days)
-        ).date().isoformat()
+    def task_event_counts(
+        self,
+        within_days: int = 7,
+        today: date | None = None,
+    ) -> dict[str, int]:
+        anchor = today or datetime.now(timezone.utc).date()
+        cutoff = (anchor - timedelta(days=within_days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -633,6 +647,19 @@ def _domain(url: str) -> str:
         return urlparse(url).netloc.lower().removeprefix("www.")
     except ValueError:
         return ""
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalise any instant to UTC before it touches the database.
+
+    Timestamps are compared as ISO strings in SQL, which compares characters,
+    not moments. Mixing a UTC-stored value against a ``+07:00`` parameter makes
+    those comparisons silently wrong whenever the offset flips the date. Naive
+    values are assumed UTC, matching what the store has always written.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _now_iso() -> str:

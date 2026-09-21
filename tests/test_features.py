@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.error import HTTPError
 
 import pytest
@@ -525,3 +527,88 @@ def _fake_urlopen(payload: dict):
         yield _Response()
 
     return _open
+
+
+# --- timezone correctness -------------------------------------------------
+
+
+def test_early_morning_done_does_not_break_the_streak(settings, monkeypatch):
+    """In UTC+7, /done before 07:00 used to land on yesterday in UTC.
+
+    The streak then compared that against today's local date and read as
+    broken, punishing the user for finishing early.
+    """
+    import daily_intel_bot.commands as commands_module
+
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    early = datetime(2026, 9, 22, 6, 30, tzinfo=tz)
+    monkeypatch.setattr(commands_module, "_now", lambda _s: early)
+
+    handle_command(settings, "/done")
+
+    store = StateStore(settings.state_db_path)
+    assert "2026-09-22" in store.done_days(today=early.date())
+    assert current_streak(store.done_days(today=early.date()), early.date()) == 1
+
+
+def test_task_events_use_the_local_calendar_day():
+    import tempfile
+
+    store = StateStore(str(Path(tempfile.mkdtemp()) / "t.db"))
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    store.record_task_event("t", "done", "", datetime(2026, 9, 22, 1, 0, tzinfo=tz))
+    # 01:00 ICT is still 2026-09-21 in UTC; the streak cares about local days.
+    assert store.done_days(today=date(2026, 9, 22)) == {"2026-09-22"}
+
+
+def test_vocabulary_due_check_survives_a_local_timezone_now():
+    """SQL compares ISO strings, so a +07:00 parameter must be normalised."""
+    import tempfile
+
+    store = StateStore(str(Path(tempfile.mkdtemp()) / "t.db"))
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    created = datetime(2026, 9, 22, 7, 30, tzinfo=tz)  # 00:30 UTC
+    store.record_vocabulary([("pervasive", "lan toa", "x")], now=created)
+
+    # Local clock a little before the word is due: must not be returned.
+    too_early = datetime(2026, 9, 23, 6, 0, tzinfo=tz)  # 23:00 UTC on the 22nd
+    assert store.due_vocabulary(now=too_early) == []
+
+    # Once the interval really has elapsed, it is.
+    later = datetime(2026, 9, 23, 9, 0, tzinfo=tz)  # 02:00 UTC on the 23rd
+    assert [entry.word for entry in store.due_vocabulary(now=later)] == ["pervasive"]
+
+
+# --- retry backoff --------------------------------------------------------
+
+
+def test_rate_limit_backs_off_far_harder_than_a_server_error():
+    """429 is a quota, not a blip; retrying on a 503 rhythm just hammers it."""
+    from daily_intel_bot.obs import _delay_for
+
+    server_error = HTTPError("u", 503, "busy", {}, None)
+    rate_limited = HTTPError("u", 429, "slow down", {}, None)
+    assert _delay_for(rate_limited, backoff=2.0, attempt=1) > _delay_for(
+        server_error, backoff=2.0, attempt=1
+    )
+
+
+def test_retry_after_header_is_honoured():
+    from daily_intel_bot.obs import _delay_for
+
+    exc = HTTPError("u", 429, "slow down", {"Retry-After": "7"}, None)
+    assert _delay_for(exc, backoff=2.0, attempt=1) == 7.0
+
+
+def test_retry_delay_is_capped():
+    from daily_intel_bot.obs import MAX_RETRY_SLEEP_SECONDS, _delay_for
+
+    exc = HTTPError("u", 429, "slow down", {"Retry-After": "99999"}, None)
+    assert _delay_for(exc, backoff=2.0, attempt=1) == MAX_RETRY_SLEEP_SECONDS
+
+
+def test_garbage_retry_after_falls_back_to_the_default_backoff():
+    from daily_intel_bot.obs import RATE_LIMIT_BACKOFF_SECONDS, _delay_for
+
+    exc = HTTPError("u", 429, "slow down", {"Retry-After": "soon"}, None)
+    assert _delay_for(exc, backoff=2.0, attempt=1) == RATE_LIMIT_BACKOFF_SECONDS

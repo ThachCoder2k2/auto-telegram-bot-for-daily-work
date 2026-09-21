@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 from html import escape
@@ -337,7 +337,7 @@ def render_daily_briefing(
     news_by_category = _apply_item_takes(settings, news_by_category, focus, tasks)
     # Streak is derived from the task-event log, not from a counter that only
     # ever got written back unchanged.
-    streak = current_streak(store.done_days(), now.date())
+    streak = current_streak(store.done_days(today=now.date()), now.date())
 
     lines = [
         _briefing_title(persona),
@@ -429,7 +429,7 @@ def render_daily_briefing(
     lines.append(f"🧪 <b>Next micro-task:</b> {escape(micro_task)}")
     lines.append(f"🧱 <b>If blocked:</b> {escape(_blocked_prompt(state.blocked_reason))}")
     lines.append(f"🔥 <b>Streak:</b> {streak} day(s) {_streak_bar(streak)}")
-    weekly = store.task_event_counts(within_days=7)
+    weekly = store.task_event_counts(within_days=7, today=now.date())
     if weekly:
         lines.append(
             "📈 <b>Last 7 days:</b> "
@@ -496,7 +496,7 @@ def render_daily_briefing(
     lines.append(f"✨ <b>Band 8 phrase:</b> {escape(band8_phrase)}")
 
     if settings.weekly_recap_enabled and now.weekday() == settings.weekly_recap_weekday:
-        lines.extend(_render_weekly_recap(store, persona, streak))
+        lines.extend(_render_weekly_recap(store, persona, streak, now.date()))
 
     task_text = "; ".join(tasks) if tasks else "None"
     lines.extend([_rule(), "💾 <b>5. State</b>"])
@@ -506,17 +506,31 @@ def render_daily_briefing(
     if trend_line:
         lines.append(trend_line)
     scanned = sum(len(items) for items in news_by_category.values())
-    provider = (
+    configured = (
         "Gemini"
         if settings.ai_provider == "gemini" and settings.gemini_api_key
         else "OpenAI"
         if settings.openai_enabled and settings.openai_api_key
-        else "local rules"
+        else ""
     )
+    # Report what happened, not what was configured. A bare "AI: local rules"
+    # left no way to tell a disabled backend from a rate-limited one.
+    if not configured:
+        provider = "local rules"
+    elif ai_sections is None:
+        provider = f"local rules — {configured} unavailable"
+    else:
+        provider = configured
     lines.append(
         f"🤖 <i>{scanned} items scanned · AI: {escape(provider)} · "
         f"generated {now.strftime('%H:%M')} {escape(settings.timezone.split('/')[-1])}</i>"
     )
+    if configured and settings.item_takes_enabled and not any(
+        item.why_it_matters
+        for items in news_by_category.values()
+        for item in items
+    ):
+        lines.append("⚠️ <i>Per-item takes unavailable this run</i>")
     lines.append(
         f"[PERSISTENCE: {now.strftime('%Y-%m-%d')} | Tasks Remaining: {escape(task_text)} | Current Project Focus: {escape(focus)}]"
     )
@@ -581,6 +595,7 @@ def _render_weekly_recap(
     store: StateStore,
     persona: PersonaProfile | None,
     streak: int,
+    today: date,
 ) -> list[str]:
     """Sunday-only section summarising the week from stored history."""
     lines = [_rule(), "🗓️ <b>Weekly Recap</b>"]
@@ -590,7 +605,7 @@ def _render_weekly_recap(
     scanned = store.sent_count(within_days=7)
     topics = store.topic_counts(within_days=7)
     domains = store.domain_counts(within_days=7)
-    tasks = store.task_event_counts(within_days=7)
+    tasks = store.task_event_counts(within_days=7, today=today)
     total_vocab, mastered = store.vocabulary_stats()
 
     lines.append(f"📰 <b>Items delivered:</b> {scanned}")
