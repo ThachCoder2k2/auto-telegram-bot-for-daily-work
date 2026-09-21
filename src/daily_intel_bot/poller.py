@@ -97,7 +97,13 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
     # the interval still fires, without letting a reminder arrive early enough
     # to matter.
     tolerance = timedelta(seconds=settings.notion_reminder_check_seconds / 2)
-    due = due_reminders(board.tasks, now, window, tolerance)
+    due = due_reminders(
+        board.tasks,
+        now,
+        window,
+        tolerance,
+        settings.notion_default_frequency,
+    )
     sent = 0
     for task in due:
         try:

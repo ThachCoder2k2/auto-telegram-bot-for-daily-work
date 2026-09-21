@@ -57,6 +57,7 @@ def due_reminders(
     now: datetime,
     window: ReminderWindow,
     tolerance: timedelta = timedelta(0),
+    default_frequency: str = "",
 ) -> list[NotionTask]:
     """Tasks whose reminder interval has elapsed, most urgent first.
 
@@ -67,10 +68,15 @@ def due_reminders(
     the check cadence equals the reminder interval — hourly checks against an
     "Every hour" task — each check measures a hair under the interval and
     would otherwise skip, silently halving the reminder rate.
+
+    ``default_frequency`` covers tasks with Reminder ticked but no frequency
+    chosen, which otherwise look enabled while doing nothing.
     """
     if not window.is_open(now):
         return []
-    due = [task for task in tasks if _is_due(task, now, tolerance)]
+    due = [
+        task for task in tasks if _is_due(task, now, tolerance, default_frequency)
+    ]
     return sorted(due, key=_urgency)
 
 
@@ -78,10 +84,16 @@ def _is_due(
     task: NotionTask,
     now: datetime,
     tolerance: timedelta = timedelta(0),
+    default_frequency: str = "",
 ) -> bool:
     if not task.reminder or task.is_done:
         return False
     frequency = task.reminder_frequency.strip().lower()
+    if not frequency:
+        # Ticking Reminder and leaving Frequency blank reads as "remind me",
+        # so fall back rather than silently doing nothing. An explicit "None"
+        # still means never.
+        frequency = default_frequency.strip().lower()
     if not frequency or frequency == NEVER:
         return False
     if frequency == ONCE:

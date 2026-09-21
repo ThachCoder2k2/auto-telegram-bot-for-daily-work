@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     # the user at 03:00; a reminder that came due overnight fires at the open.
     notion_quiet_start: int = 8
     notion_quiet_end: int = 22
+    # Used when Reminder is ticked but Reminder Frequency was left blank.
+    # Set to "None" to require an explicit frequency instead.
+    notion_default_frequency: str = "Every day"
     # How often the poller looks for due reminders. The finest frequency the
     # board offers is hourly, so checking more often only burns API calls.
     notion_reminder_check_seconds: int = 3600

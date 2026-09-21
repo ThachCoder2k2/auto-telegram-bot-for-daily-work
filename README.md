@@ -182,6 +182,10 @@ elapsed, then `Last Reminded` is stamped so the interval advances. Unknown
 frequency values never fire, so adding an option in Notion cannot turn into
 hourly spam.
 
+Ticking `Reminder` but leaving `Reminder Frequency` blank falls back to
+`NOTION_DEFAULT_FREQUENCY` (default *Every day*): a ticked checkbox that did
+nothing is a trap. An explicit *None* is a decision and still means never.
+
 Nudges are held outside `NOTION_QUIET_START`–`NOTION_QUIET_END`; one that comes
 due overnight fires at the first check after the window opens. A window that
 wraps midnight (22→6) is treated as a union, not an empty range.

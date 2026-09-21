@@ -219,6 +219,39 @@ def test_frequency_none_and_unchecked_are_ignored():
     assert due_reminders([_task(reminder=False)], now, ReminderWindow(0, 0)) == []
 
 
+def test_blank_frequency_falls_back_to_the_default():
+    """Ticking Reminder and leaving Frequency blank reads as 'remind me'."""
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    task = _task(frequency="", last=None)
+    assert due_reminders([task], now, ReminderWindow(0, 0)) == []
+    assert due_reminders(
+        [task], now, ReminderWindow(0, 0), default_frequency="Every day"
+    ) == [task]
+
+
+def test_default_frequency_respects_its_own_interval():
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    fresh = _task(frequency="", last=now - timedelta(hours=2))
+    assert (
+        due_reminders(
+            [fresh], now, ReminderWindow(0, 0), default_frequency="Every day"
+        )
+        == []
+    )
+
+
+def test_explicit_none_still_beats_the_default():
+    """An explicit 'None' is a decision; blank is an omission."""
+    now = datetime(2026, 9, 21, 12, tzinfo=UTC)
+    opted_out = _task(frequency="None", last=None)
+    assert (
+        due_reminders(
+            [opted_out], now, ReminderWindow(0, 0), default_frequency="Every day"
+        )
+        == []
+    )
+
+
 def test_unknown_frequency_never_fires():
     """A new option in Notion must not default to hourly spam."""
     now = datetime(2026, 9, 21, 12, tzinfo=UTC)
