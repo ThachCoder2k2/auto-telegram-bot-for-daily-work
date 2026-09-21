@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     notion_quiet_end: int = 22
     # Used when Reminder is ticked but Reminder Frequency was left blank.
     # Set to "None" to require an explicit frequency instead.
-    notion_default_frequency: str = "Every day"
+    notion_default_frequency: str = "Every hour"
     # How often the poller looks for due reminders. The finest frequency the
     # board offers is hourly, so checking more often only burns API calls.
     notion_reminder_check_seconds: int = 3600
@@ -109,7 +109,8 @@ class Settings(BaseSettings):
     notion_notes_enabled: bool = False
     notion_notes_database_id: str = ""
     notion_notes_lookahead_days: int = 14
-    notion_notes_alert_days: int = 3
+    # Dated entries are flagged the day before, and again on the day.
+    notion_notes_alert_days: int = 1
     # Let the AI backend write the nudge in the day's persona voice, the way
     # it already writes the brief. Falls back to the canned persona lines.
     notion_ai_voice_enabled: bool = True

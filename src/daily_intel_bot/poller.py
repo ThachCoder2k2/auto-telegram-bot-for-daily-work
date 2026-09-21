@@ -31,6 +31,7 @@ from daily_intel_bot.obs import get_logger, is_transient_http_error, with_retrie
 from daily_intel_bot.openai_client import generate_nudge_voice
 from daily_intel_bot.persona import select_persona
 from daily_intel_bot.reminders import (
+    NAG_THRESHOLD,
     ReminderWindow,
     due_reminders,
     notes_needing_alert,
@@ -50,6 +51,9 @@ _LOG = get_logger("poller")
 # Backoff after an unexpected loop error, so a persistent failure does not
 # become a hot loop against the Telegram API.
 ERROR_SLEEP_SECONDS = 15
+
+# Remembers which batch the last AI-written nudge covered.
+NUDGE_FINGERPRINT_META_KEY = "notion_nudge_fingerprint"
 
 
 def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
@@ -140,10 +144,19 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         forced_key=settings.bot_persona_force,
         now=now,
     )
-    voice = _write_voice(
-        settings,
-        task_context(due, now, counts, persona, settings.bot_persona_safe_mode),
-        len(due),
+    # Hourly nudges over an unchanged board would spend an AI call every hour
+    # saying the same thing, starving the daily brief's quota. Only pay for a
+    # fresh voice when the batch actually changed.
+    fingerprint = _batch_fingerprint(due, counts)
+    changed = store.get_meta(NUDGE_FINGERPRINT_META_KEY, "") != fingerprint
+    voice = (
+        _write_voice(
+            settings,
+            task_context(due, now, counts, persona, settings.bot_persona_safe_mode),
+            len(due),
+        )
+        if changed
+        else None
     )
     try:
         # One batched message: three separately-worded nudges an hour apart is
@@ -155,6 +168,7 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         _LOG.warning("reminder send failed: %s: %s", type(exc).__name__, exc)
         return 0
 
+    store.set_meta(NUDGE_FINGERPRINT_META_KEY, fingerprint)
     for task in due:
         stamp_reminded(settings, board.schema, task.page_id, now)
     _LOG.info("sent 1 batched nudge covering %d Notion task(s)", len(due))
@@ -259,6 +273,19 @@ def _write_voice(
             exc,
         )
         return None
+
+
+def _batch_fingerprint(tasks, counts: dict[str, int]) -> str:
+    """Identify a nudge batch by its tasks and how escalated each one is.
+
+    Counts are bucketed so a voice is only re-bought when the tone would
+    actually change, not on every single increment.
+    """
+    parts = sorted(
+        f"{task.page_id}:{min(counts.get(task.page_id, 0), NAG_THRESHOLD)}"
+        for task in tasks
+    )
+    return "|".join(parts)
 
 
 def _note_alert_key(page_id: str) -> str:

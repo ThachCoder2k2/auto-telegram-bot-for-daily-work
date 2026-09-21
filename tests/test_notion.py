@@ -705,3 +705,24 @@ def test_note_context_marks_itself_as_a_heads_up_not_a_scolding():
     context = note_context([_note(days=2)], NOW, None, True)
     assert context["kind"] == "dated_notes"
     assert context["items"][0]["days_until"] == 2
+
+
+def test_nudge_voice_is_only_re_bought_when_the_batch_changes():
+    """Hourly nudges over an unchanged board must not burn an AI call each time."""
+    from daily_intel_bot.poller import _batch_fingerprint
+
+    a, b = _task(page_id="p1"), _task(page_id="p2")
+    same = _batch_fingerprint([a, b], {"p1": 1, "p2": 1})
+    assert _batch_fingerprint([b, a], {"p1": 1, "p2": 1}) == same  # order-free
+    assert _batch_fingerprint([a], {"p1": 1}) != same              # task left
+    # Escalating past the nag threshold changes the tone, so buy a new voice.
+    assert _batch_fingerprint([a, b], {"p1": NAG_THRESHOLD, "p2": 1}) != same
+    # A bump that does not change the tone reuses what we already paid for.
+    assert _batch_fingerprint([a, b], {"p1": 2, "p2": 1}) != same
+
+
+def test_notes_are_flagged_the_day_before_and_on_the_day():
+    tomorrow, today_ = _note(days=1, page_id="a"), _note(days=0, page_id="b")
+    later = _note(days=2, page_id="c")
+    flagged = notes_needing_alert([tomorrow, today_, later], NOW, 1)
+    assert {e.page_id for e in flagged} == {"a", "b"}
