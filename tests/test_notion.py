@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -9,16 +10,29 @@ import pytest
 from daily_intel_bot import notion_tasks
 from daily_intel_bot.config import Settings
 from daily_intel_bot.notion_client import NotionSchema, NotionTask, _parse_task, detect_schema
+from daily_intel_bot.persona import PERSONA_PROFILES
 from daily_intel_bot.reminders import (
+    NAG_THRESHOLD,
     ReminderWindow,
+    describe_gaps,
     due_reminders,
-    render_reminder,
+    render_reminder_batch,
     sort_tasks,
 )
 from daily_intel_bot.state_store import StateStore
 
 
 UTC = timezone.utc
+NOW = datetime(2026, 9, 21, 17, tzinfo=UTC)
+
+
+def _replace_idle(task: NotionTask, days: int) -> NotionTask:
+    """Rebuild a task as though Notion last saw an edit ``days`` ago."""
+    return dataclasses.replace(
+        task,
+        edited_at=NOW - timedelta(days=days),
+        created_at=NOW - timedelta(days=days + 1),
+    )
 
 
 @pytest.fixture
@@ -334,9 +348,104 @@ def test_unsized_tasks_sort_after_sized_ones():
 
 def test_reminder_message_escapes_user_content():
     task = _task("Fix <script> & hitbox", priority="High")
-    rendered = render_reminder(task)
+    rendered = render_reminder_batch([task], NOW, None, {})
     assert "&lt;script&gt; &amp; hitbox" in rendered
     assert "<script>" not in rendered
+
+
+# --- reminder message -----------------------------------------------------
+
+
+def test_batch_is_one_message_not_one_per_task():
+    """Three identically-worded nudges at once is noise, not three reminders."""
+    tasks = [
+        _task("Alpha", page_id="a"),
+        _task("Beta", page_id="b"),
+        _task("Gamma", page_id="c"),
+    ]
+    rendered = render_reminder_batch(tasks, NOW, None, {})
+    for number, title in enumerate(("Alpha", "Beta", "Gamma"), start=1):
+        assert title in rendered
+        assert f"{number}. " in rendered
+    # The call-to-action and framing appear once, not once per task.
+    assert rendered.count("/ntasks") == 1
+    assert rendered.count("Nhắc việc") == 1
+
+
+def test_persona_voice_is_used():
+    persona = PERSONA_PROFILES["rot_maiden"]
+    rendered = render_reminder_batch([_task()], NOW, persona, {})
+    assert persona.name in rendered
+    assert persona.reminder_line in rendered
+
+
+def test_tone_escalates_once_a_task_is_being_dodged():
+    persona = PERSONA_PROFILES["rot_maiden"]
+    task = _task(page_id="p1")
+    calm = render_reminder_batch([task], NOW, persona, {"p1": 1})
+    nagging = render_reminder_batch([task], NOW, persona, {"p1": NAG_THRESHOLD})
+    assert persona.reminder_line in calm
+    assert persona.nag_line in nagging
+    assert persona.nag_line not in calm
+
+
+def test_per_task_line_carries_effort_idleness_and_count():
+    task = _task("Nâng cấp uploader", page_id="p1", estimated="1 hour")
+    task = _replace_idle(task, days=6)
+    rendered = render_reminder_batch([task], NOW, None, {"p1": 4})
+    assert "1 hour" in rendered
+    assert "nằm im 6 ngày" in rendered
+    assert "nhắc lần 4" in rendered
+
+
+def test_missing_estimate_is_named_rather_than_omitted():
+    """Silence about a missing field is what made the old nudge useless."""
+    rendered = render_reminder_batch([_task(page_id="p1")], NOW, None, {})
+    assert "chưa ước lượng" in rendered
+
+
+# --- gap analysis ---------------------------------------------------------
+
+
+def test_gaps_flag_a_stalled_task():
+    stalled = _replace_idle(_task("Nâng cấp uploader", page_id="p1"), days=6)
+    gaps = describe_gaps([stalled], NOW, {})
+    assert any("6 ngày" in gap and "Nâng cấp uploader" in gap for gap in gaps)
+
+
+def test_gaps_flag_a_task_being_dodged():
+    task = _replace_idle(_task("Dodged", page_id="p1"), days=0)
+    gaps = describe_gaps([task], NOW, {"p1": 5})
+    assert any("5 lần" in gap for gap in gaps)
+
+
+def test_gaps_count_missing_priority_and_estimate():
+    tasks = [
+        _task("a", page_id="a", priority="High", estimated="1 hour"),
+        _task("b", page_id="b"),
+        _task("c", page_id="c"),
+    ]
+    gaps = describe_gaps(tasks, NOW, {})
+    assert any("2 việc chưa đặt Priority" in gap for gap in gaps)
+    assert any("2 việc chưa có Estimated Time" in gap for gap in gaps)
+
+
+def test_a_healthy_board_reports_no_gaps():
+    tasks = [
+        _replace_idle(
+            _task("a", page_id="a", priority="High", estimated="1 hour"), days=0
+        )
+    ]
+    assert describe_gaps(tasks, NOW, {"a": 1}) == []
+
+
+def test_in_progress_stale_task_is_not_called_unstarted():
+    """Work in flight that paused is a different problem from never starting."""
+    task = _replace_idle(
+        _task("a", page_id="a", status="In Progress"), days=9
+    )
+    gaps = describe_gaps([task], NOW, {})
+    assert not any("Chưa bắt đầu" in gap for gap in gaps)
 
 
 # --- task numbering -------------------------------------------------------

@@ -61,10 +61,25 @@ class NotionTask:
     reminder_frequency: str
     last_reminded: datetime | None
     url: str
+    # Notion maintains these on every page; they are what makes "this has sat
+    # untouched for six days" possible to say.
+    created_at: datetime | None = None
+    edited_at: datetime | None = None
 
     @property
     def is_done(self) -> bool:
         return self.status.strip().lower() == "done"
+
+    def idle_days(self, now: datetime) -> int | None:
+        """Days since anyone last edited the task."""
+        if self.edited_at is None:
+            return None
+        return max(0, (now - self.edited_at).days)
+
+    def age_days(self, now: datetime) -> int | None:
+        if self.created_at is None:
+            return None
+        return max(0, (now - self.created_at).days)
 
 
 # --- transport ------------------------------------------------------------
@@ -273,6 +288,16 @@ def _parse_task(page: dict, schema: NotionSchema) -> NotionTask:
     if schema.status_is_checkbox:
         status = "Done" if flag(schema.status) else "Not Started"
 
+    def timestamp(key: str) -> datetime | None:
+        raw = page.get(key)
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
     return NotionTask(
         page_id=str(page.get("id") or ""),
         title=text(schema.title),
@@ -285,6 +310,8 @@ def _parse_task(page: dict, schema: NotionSchema) -> NotionTask:
         ),
         last_reminded=when(schema.last_reminded) if schema.last_reminded else None,
         url=str(page.get("url") or ""),
+        created_at=timestamp("created_time"),
+        edited_at=timestamp("last_edited_time"),
     )
 
 

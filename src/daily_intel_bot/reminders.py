@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from html import escape
 
 from daily_intel_bot.notion_client import NotionTask
+from daily_intel_bot.persona import PersonaProfile
 
 
 # Notion's own wording, mapped to intervals. Unknown values are ignored rather
@@ -155,17 +156,127 @@ def render_task_line(index: int, task: NotionTask) -> str:
     return "".join(parts)
 
 
-def render_reminder(task: NotionTask) -> str:
-    icon = PRIORITY_ICONS.get(task.priority.strip().lower(), "⚪")
-    lines = [f"⏰ <b>Nhắc việc</b>", f"{icon} <b>{escape(task.title)}</b>"]
-    meta = [
-        value
-        for value in (task.status, task.estimated_time, task.reminder_frequency)
-        if value
-    ]
-    if meta:
-        lines.append(f"<i>{escape(' · '.join(meta))}</i>")
-    if task.url:
-        lines.append(f'🔗 <a href="{escape(task.url)}">Mở trong Notion</a>')
-    lines.append("<code>/ntasks</code> để xem danh sách · <code>/ndone n</code> khi xong")
+# A task nudged this many times without being touched has stopped being
+# forgotten and started being avoided.
+NAG_THRESHOLD = 3
+# Days untouched before a task counts as stalling.
+STALE_DAYS = 3
+
+
+def render_reminder_batch(
+    tasks: list[NotionTask],
+    now: datetime,
+    persona: PersonaProfile | None,
+    reminder_counts: dict[str, int],
+) -> str:
+    """One message for the whole batch, in the day's persona voice.
+
+    Sending a separate identically-worded message per task turned three
+    reminders into three walls of boilerplate. This keeps the framing once and
+    spends the space on what is actually different between the tasks: how long
+    each has sat, how often it has been nudged, and what is missing from it.
+    """
+    worst_count = max((reminder_counts.get(t.page_id, 0) for t in tasks), default=0)
+    nagging = worst_count >= NAG_THRESHOLD
+
+    lines: list[str] = []
+    if persona:
+        voice = persona.nag_line if nagging else persona.reminder_line
+        lines.append(f"{persona.icon} <b>{escape(persona.name)}</b>")
+        lines.append(f"<blockquote>{escape(voice)}</blockquote>")
+    else:
+        lines.append("⏰ <b>Nhắc việc</b>" if not nagging else "⏰ <b>Vẫn chưa xong</b>")
+    lines.append("")
+
+    for index, task in enumerate(tasks, start=1):
+        icon = PRIORITY_ICONS.get(task.priority.strip().lower(), "⚪")
+        title = escape(task.title)
+        if task.url:
+            title = f'<a href="{escape(task.url)}">{title}</a>'
+        lines.append(f"{icon} <b>{index}. {title}</b>")
+        detail = _task_signals(task, now, reminder_counts.get(task.page_id, 0))
+        if detail:
+            lines.append(f"   <i>{escape(' · '.join(detail))}</i>")
+
+    gaps = describe_gaps(tasks, now, reminder_counts)
+    if gaps:
+        lines.append("")
+        lines.extend(f"⚠️ <i>{escape(gap)}</i>" for gap in gaps)
+
+    lines.append("")
+    lines.append("<code>/ndone &lt;số&gt;</code> khi xong · <code>/ntasks</code> xem tất cả")
     return "\n".join(lines)
+
+
+def _task_signals(task: NotionTask, now: datetime, count: int) -> list[str]:
+    """The per-task facts worth the line: effort, idleness, nudge count."""
+    parts: list[str] = []
+    if task.estimated_time:
+        parts.append(task.estimated_time)
+    else:
+        parts.append("chưa ước lượng")
+
+    idle = task.idle_days(now)
+    if idle is not None:
+        parts.append("chạm hôm nay" if idle == 0 else f"nằm im {idle} ngày")
+    if count > 1:
+        parts.append(f"nhắc lần {count}")
+    if task.status and task.status.strip().lower() != "not started":
+        parts.append(task.status)
+    return parts
+
+
+def describe_gaps(
+    tasks: list[NotionTask],
+    now: datetime,
+    reminder_counts: dict[str, int],
+) -> list[str]:
+    """Name what is missing, so a nudge says more than the task's own title.
+
+    "What am I not seeing" is the question a reminder should answer: which
+    task is rotting, which is being dodged, and which cannot be prioritised
+    because it was never given a priority or a size.
+    """
+    gaps: list[str] = []
+
+    stalled = [
+        task
+        for task in tasks
+        if (task.idle_days(now) or 0) >= STALE_DAYS
+        and task.status.strip().lower() == "not started"
+    ]
+    if stalled:
+        worst = max(stalled, key=lambda t: t.idle_days(now) or 0)
+        gaps.append(
+            f"Chưa bắt đầu {worst.idle_days(now)} ngày: {_short(worst.title)}"
+            + (f" (+{len(stalled) - 1} việc nữa)" if len(stalled) > 1 else "")
+        )
+
+    dodged = [
+        task for task in tasks if reminder_counts.get(task.page_id, 0) >= NAG_THRESHOLD
+    ]
+    if dodged:
+        worst = max(dodged, key=lambda t: reminder_counts.get(t.page_id, 0))
+        count = reminder_counts.get(worst.page_id, 0)
+        gaps.append(
+            f"Nhắc {count} lần vẫn chưa động: {_short(worst.title)} "
+            "— chia nhỏ ra, hoặc /ndone nếu không còn cần"
+        )
+
+    missing_priority = [task for task in tasks if not task.priority.strip()]
+    if missing_priority:
+        gaps.append(
+            f"{len(missing_priority)} việc chưa đặt Priority nên không biết làm cái nào trước"
+        )
+
+    missing_estimate = [task for task in tasks if not task.estimated_time.strip()]
+    if missing_estimate:
+        gaps.append(
+            f"{len(missing_estimate)} việc chưa có Estimated Time nên không biết có nhét vừa hôm nay không"
+        )
+    return gaps
+
+
+def _short(value: str, limit: int = 42) -> str:
+    value = value.strip()
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"

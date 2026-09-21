@@ -20,6 +20,11 @@ class PersonaProfile:
     continuity_line: str
     ielts_line: str
     closing_line: str
+    # Reminder voice. ``nag_line`` takes over once a task has been nudged
+    # repeatedly without moving, so the bot escalates instead of repeating
+    # itself word for word every hour.
+    reminder_line: str = "Việc đang đợi bạn."
+    nag_line: str = "Việc này nhắc mãi mà vẫn nằm im."
 
 
 PERSONA_PROFILES: dict[str, PersonaProfile] = {
@@ -43,6 +48,8 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         continuity_line="Tell me the truth, Master. Did you obey yesterday's task?",
         ielts_line="Sharpen your tongue; I expect a cleaner answer today.",
         closing_line="I will remember what remains unfinished, Master.",
+        reminder_line="Master, you left something untouched. Shall I keep it warm for you?",
+        nag_line="You keep walking past this one, Master. I am starting to enjoy watching you avoid it.",
     ),
     "milf_teacher": PersonaProfile(
         key="milf_teacher",
@@ -64,6 +71,8 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         continuity_line="Accountability check. Be honest.",
         ielts_line="Band 8 practice. Precision first.",
         closing_line="Homework remains recorded. Do not waste tomorrow.",
+        reminder_line="Student. This is still open. Fifteen minutes now beats an hour later.",
+        nag_line="Student, I have asked repeatedly. Either do it, resize it, or drop it — but stop pretending.",
     ),
     "soft_girlfriend": PersonaProfile(
         key="soft_girlfriend",
@@ -85,6 +94,8 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         continuity_line="Gentle check-in.",
         ielts_line="A little English practice for future you.",
         closing_line="I saved the thread so we can continue tomorrow, babe.",
+        reminder_line="Hey babe, this one is still waiting. No pressure, just a nudge.",
+        nag_line="Babe, this has been sitting a while. Is it stuck, or is it just too big to start?",
     ),
     "rot_maiden": PersonaProfile(
         key="rot_maiden",
@@ -106,6 +117,8 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         continuity_line="Oath check.",
         ielts_line="Words are also weapons, my lord.",
         closing_line="The unfinished oath is sealed until tomorrow.",
+        reminder_line="An oath remains unfulfilled, my lord. The hour is still yours.",
+        nag_line="This oath rots, my lord. Each hour it sits, it grows heavier to lift.",
     ),
     "final_boss_queen": PersonaProfile(
         key="final_boss_queen",
@@ -127,6 +140,8 @@ PERSONA_PROFILES: dict[str, PersonaProfile] = {
         continuity_line="Progress judgment.",
         ielts_line="Speak better, or be crushed by mediocrity.",
         closing_line="Your remaining weakness has been recorded.",
+        reminder_line="Still undone, little challenger. Prove me wrong before the hour turns.",
+        nag_line="How many times must I repeat myself? This one is beginning to define you.",
     ),
 }
 

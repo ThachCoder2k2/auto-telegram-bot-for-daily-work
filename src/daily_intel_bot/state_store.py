@@ -127,6 +127,20 @@ class StateStore:
                 )
                 """
             )
+            # How often a Notion task has been nudged. A high count against an
+            # untouched task is the clearest signal that it is being avoided
+            # rather than simply forgotten.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reminder_log (
+                    page_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    count INTEGER NOT NULL DEFAULT 0,
+                    first_reminded TEXT NOT NULL,
+                    last_reminded TEXT NOT NULL
+                )
+                """
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_events_day ON task_events(day)"
             )
@@ -447,6 +461,48 @@ class StateStore:
                 "SELECT COUNT(*) FROM vocab WHERE box >= ?", (MAX_LEITNER_BOX,)
             ).fetchone()[0]
         return int(total), int(mastered)
+
+    # --- reminder counts --------------------------------------------------
+
+    def record_reminder(
+        self,
+        page_id: str,
+        title: str,
+        now: datetime | None = None,
+    ) -> int:
+        """Log a nudge and return how many times this task has been nudged."""
+        now = now or datetime.now(timezone.utc)
+        stamp = now.isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO reminder_log (
+                    page_id, title, count, first_reminded, last_reminded
+                )
+                VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(page_id) DO UPDATE SET
+                    count = count + 1,
+                    title = excluded.title,
+                    last_reminded = excluded.last_reminded
+                """,
+                (page_id, title, stamp, stamp),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT count FROM reminder_log WHERE page_id = ?", (page_id,)
+            ).fetchone()
+        return int(row[0]) if row else 1
+
+    def reminder_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT page_id, count FROM reminder_log").fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def clear_reminder_log(self, page_id: str) -> None:
+        """Forget a task's nudge history, e.g. once it is completed."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM reminder_log WHERE page_id = ?", (page_id,))
+            conn.commit()
 
     # --- task events ------------------------------------------------------
 

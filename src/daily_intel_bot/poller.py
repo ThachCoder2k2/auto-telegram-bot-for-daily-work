@@ -17,7 +17,12 @@ from daily_intel_bot.config import Settings
 from daily_intel_bot.delivery import send_daily_digest
 from daily_intel_bot.notion_tasks import load_board_quietly, stamp_reminded
 from daily_intel_bot.obs import get_logger
-from daily_intel_bot.reminders import ReminderWindow, due_reminders, render_reminder
+from daily_intel_bot.persona import select_persona
+from daily_intel_bot.reminders import (
+    ReminderWindow,
+    due_reminders,
+    render_reminder_batch,
+)
 from daily_intel_bot.state_store import StateStore
 from daily_intel_bot.telegram_client import send_message
 from daily_intel_bot.telegram_updates import (
@@ -104,18 +109,34 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         tolerance,
         settings.notion_default_frequency,
     )
-    sent = 0
+    if not due:
+        return 0
+
+    # Count the nudge before rendering so the message can say "lần 4" and
+    # escalate its tone on the same pass.
+    counts = {
+        task.page_id: store.record_reminder(task.page_id, task.title, now)
+        for task in due
+    }
+    persona = select_persona(
+        enabled=settings.bot_persona_enabled,
+        rotation=settings.bot_persona_rotation,
+        pool=settings.bot_persona_pool,
+        forced_key=settings.bot_persona_force,
+        now=now,
+    )
+    try:
+        # One batched message: three separately-worded nudges an hour apart is
+        # a notification, three identical ones at once is just noise.
+        send_message(settings, render_reminder_batch(due, now, persona, counts))
+    except Exception as exc:  # noqa: BLE001 - a failed nudge retries next cycle
+        _LOG.warning("reminder send failed: %s: %s", type(exc).__name__, exc)
+        return 0
+
     for task in due:
-        try:
-            send_message(settings, render_reminder(task))
-        except Exception as exc:  # noqa: BLE001 - one bad nudge must not stop the rest
-            _LOG.warning("reminder send failed for %s: %s", task.title, exc)
-            continue
         stamp_reminded(settings, board.schema, task.page_id, now)
-        sent += 1
-    if sent:
-        _LOG.info("sent %d Notion reminder(s)", sent)
-    return sent
+    _LOG.info("sent 1 batched nudge covering %d Notion task(s)", len(due))
+    return len(due)
 
 
 def _dispatch(settings: Settings, text: str) -> None:
