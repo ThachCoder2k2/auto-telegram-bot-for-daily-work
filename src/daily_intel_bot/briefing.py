@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 from html import escape
 from html import unescape
@@ -11,13 +12,26 @@ import re
 from urllib import parse, request
 from zoneinfo import ZoneInfo
 
-from daily_intel_bot.collectors import collect_hacker_news
+from daily_intel_bot.collectors import TAVILY_EXCLUDED_DOMAINS, collect_hacker_news
 from daily_intel_bot.config import Settings
+from daily_intel_bot.enrich import (
+    EnrichmentRequest,
+    build_take_context,
+    parse_takes,
+)
 from daily_intel_bot.models import SignalItem
-from daily_intel_bot.openai_client import AIBriefingSections, generate_ai_briefing_sections
-from daily_intel_bot.gemini_client import generate_ai_briefing_sections_gemini
+from daily_intel_bot.openai_client import (
+    AIBriefingSections,
+    generate_ai_briefing_sections,
+    generate_item_takes,
+)
+from daily_intel_bot.gemini_client import (
+    generate_ai_briefing_sections_gemini,
+    generate_item_takes_gemini,
+)
 from daily_intel_bot.obs import get_logger
 from daily_intel_bot.persona import PersonaProfile, persona_intro, select_persona
+from daily_intel_bot.state_store import StateStore, current_streak
 from daily_intel_bot.tavily_client import TavilySearchSpec, search_tavily
 
 
@@ -40,6 +54,14 @@ class BriefingNewsItem:
     url: str
     source: str
     summary: str
+    # Raw signals kept alongside the item so scoring stays inspectable rather
+    # than being folded into impact_score at collection time.
+    tavily_score: float = 0.0
+    hn_points: int = 0
+    hn_comments: int = 0
+    published_at: datetime | None = None
+    corroboration: int = 1
+    why_it_matters: str = ""
 
 
 @dataclass(slots=True)
@@ -50,6 +72,35 @@ class BriefingState:
     streak: int
     blocked_reason: str
     next_micro_task: str
+
+
+@dataclass(frozen=True, slots=True)
+class FeedMemory:
+    """Everything the ranker knows about past sends and user feedback.
+
+    Gathered once per run so the collector does not re-query SQLite for every
+    category.
+    """
+
+    recent_keys: set[str]
+    mutes: list[tuple[str, str]]
+    topic_feedback: dict[str, float]
+    domain_counts: dict[str, int]
+    focus_terms: tuple[str, ...] = ()
+
+    @classmethod
+    def empty(cls) -> "FeedMemory":
+        return cls(recent_keys=set(), mutes=[], topic_feedback={}, domain_counts={})
+
+    def is_muted(self, title: str, url: str) -> bool:
+        haystack = f"{title} {url}".lower()
+        domain = _domain_of(url)
+        for kind, value in self.mutes:
+            if kind == "domain" and value and value in domain:
+                return True
+            if kind == "keyword" and value and value in haystack:
+                return True
+        return False
 
 
 CATEGORY_SPECS: tuple[BriefingCategorySpec, ...] = (
@@ -117,6 +168,76 @@ MAX_BRIEFING_CHARS = 12000
 VISIBLE_NEWS_PER_CATEGORY = 3
 USER_AGENT = "clawbot-daily-intel-telegram/0.1"
 
+# Terms that make an item actually about building software.
+WEB_TECH_TERMS = (
+    "agent",
+    "api",
+    "browser",
+    "chrome",
+    "cli",
+    "cloud",
+    "code",
+    "coding",
+    "compiler",
+    "css",
+    "database",
+    "debug",
+    "deploy",
+    "developer",
+    "devops",
+    "docker",
+    "engine",
+    "framework",
+    "git",
+    "github",
+    "godot",
+    "javascript",
+    "kubernetes",
+    "language",
+    "library",
+    "linux",
+    "llm",
+    "model",
+    "open source",
+    "postgres",
+    "programming",
+    "python",
+    "react",
+    "release",
+    "runtime",
+    "rust",
+    "sdk",
+    "server",
+    "software",
+    "sql",
+    "typescript",
+    "vercel",
+    "webassembly",
+    "wasm",
+)
+
+# Wire-service subjects that are not developer news on their own.
+MARKET_NOISE_TERMS = (
+    "bessent",
+    "bond",
+    "dow",
+    "earnings",
+    "election",
+    "fed",
+    "inflation",
+    "investors",
+    "nasdaq",
+    "president",
+    "rally",
+    "s&p",
+    "senate",
+    "shares",
+    "stocks",
+    "tariff",
+    "trump",
+    "wall street",
+)
+
 REJECT_KEYWORDS = {
     "gaming": (
         "nba",
@@ -144,27 +265,50 @@ WEB_IDEAS = (
 )
 
 
-def build_daily_briefing(settings: Settings) -> tuple[str, list[SignalItem]]:
+def build_daily_briefing(
+    settings: Settings,
+) -> tuple[str, list[SignalItem], tuple[tuple[str, str, str], ...]]:
+    """Render today's brief.
+
+    Returns the HTML text, the items worth recording as sent, and the
+    vocabulary triples the caller should push into spaced repetition.
+    """
     state = load_briefing_state(settings)
+    store = StateStore(settings.state_db_path)
+    # Memory the collector needs: what we already sent, and what the user muted.
+    memory = FeedMemory(
+        recent_keys=store.recent_sent_keys(within_days=settings.repeat_window_days),
+        mutes=store.list_mutes(),
+        topic_feedback=store.topic_feedback(),
+        domain_counts=dict(store.domain_counts(within_days=7)),
+        focus_terms=_focus_terms(state, settings),
+    )
     categories = _enabled_category_specs(settings)
     news_by_category = {
-        spec.key: _collect_category_news(settings, spec)
+        spec.key: _collect_category_news(settings, spec, memory)
         for spec in categories
     }
     selected_items = _to_signal_items(news_by_category)
-    text = render_daily_briefing(settings, state, news_by_category)
-    return text, selected_items
+    text, vocabulary = render_daily_briefing(
+        settings,
+        state,
+        news_by_category,
+        store,
+    )
+    return text, selected_items, vocabulary
 
 
 def render_daily_briefing(
     settings: Settings,
     state: BriefingState,
     news_by_category: dict[str, list[BriefingNewsItem]],
-) -> str:
+    store: StateStore | None = None,
+) -> tuple[str, tuple[tuple[str, str, str], ...]]:
+    store = store or StateStore(settings.state_db_path)
     now = datetime.now(ZoneInfo(settings.timezone))
-    tasks = state.tasks_remaining or list(settings.pending_tasks)
+    tasks = state.tasks_remaining
     focus = state.current_project_focus or settings.current_project_focus
-    first_task = tasks[0] if tasks else "the next Godot milestone"
+    first_task = tasks[0] if tasks else "Pick the next step — reply /task <text>"
     persona = select_persona(
         enabled=settings.bot_persona_enabled,
         rotation=settings.bot_persona_rotation,
@@ -180,6 +324,10 @@ def render_daily_briefing(
         now,
         persona,
     )
+    news_by_category = _apply_item_takes(settings, news_by_category, focus, tasks)
+    # Streak is derived from the task-event log, not from a counter that only
+    # ever got written back unchanged.
+    streak = current_streak(store.done_days(), now.date())
 
     lines = [
         _briefing_title(persona),
@@ -213,11 +361,15 @@ def render_daily_briefing(
                 f"🎯 <i>{escape(_category_why_matters(spec.key, display_items, focus))}</i>"
             )
         for index, item in enumerate(display_items[:VISIBLE_NEWS_PER_CATEGORY], start=1):
-            lines.append(
-                f"{index}. {_impact_bar(item.impact_score)} {_source_badge(item)}"
-            )
+            badges = _source_badge(item)
+            if item.corroboration > 1:
+                # Independent confirmation is worth surfacing, not just scoring.
+                badges += f" <b>[×{item.corroboration} sources]</b>"
+            lines.append(f"{index}. {_impact_bar(item.impact_score)} {badges}")
             lines.append(f"   <b>{_shorten_html(item.headline, 100)}</b>")
-            if index == 1:
+            if item.why_it_matters:
+                lines.append(f"   💡 <i>{_shorten_html(item.why_it_matters, 170)}</i>")
+            elif index == 1:
                 summary = _clean_summary(item.summary)
                 if summary:
                     lines.append(f"   <i>{_shorten_html(summary, 150)}</i>")
@@ -262,11 +414,22 @@ def render_daily_briefing(
         lines.append(_persona_quote(persona, persona.continuity_line))
     micro_task = state.next_micro_task or _next_project_step(focus, first_task)
     lines.append(f"🎯 <b>Pending:</b> {escape(first_task)}")
+    if len(tasks) > 1:
+        lines.append(f"📋 <b>Queued:</b> {len(tasks) - 1} more task(s)")
     lines.append(f"🧪 <b>Next micro-task:</b> {escape(micro_task)}")
     lines.append(f"🧱 <b>If blocked:</b> {escape(_blocked_prompt(state.blocked_reason))}")
-    if state.streak:
-        lines.append(f"🔥 <b>Current streak:</b> {state.streak} day(s)")
-    lines.append("❓ <b>Reply later with:</b> done / blocked / change task")
+    lines.append(f"🔥 <b>Streak:</b> {streak} day(s) {_streak_bar(streak)}")
+    weekly = store.task_event_counts(within_days=7)
+    if weekly:
+        lines.append(
+            "📈 <b>Last 7 days:</b> "
+            f"{weekly.get('done', 0)} done · {weekly.get('blocked', 0)} blocked · "
+            f"{weekly.get('dropped', 0)} dropped"
+        )
+    lines.append(
+        "❓ <b>Reply:</b> <code>/done</code> · <code>/blocked why</code> · "
+        "<code>/task new thing</code> · <code>/help</code>"
+    )
 
     lines.extend([_rule(), "📚 <b>4. IELTS Mastery</b>"])
     if persona:
@@ -283,6 +446,22 @@ def render_daily_briefing(
     )
     for word, meaning, example in vocabulary:
         lines.append(f"- <b>{escape(word)}</b>: {escape(meaning)}. {escape(example)}")
+
+    # Spaced repetition: words learned on earlier days, surfaced when their
+    # Leitner interval has elapsed. Without this the deck was write-only.
+    if settings.vocab_review_enabled:
+        due = store.due_vocabulary(limit=settings.vocab_review_limit, now=now)
+        if due:
+            lines.extend(["", "🔁 <b>Recall from earlier days:</b>"])
+            for entry in due:
+                lines.append(
+                    f"- <b>{escape(entry.word)}</b> (box {entry.box}/5) → "
+                    f"<tg-spoiler>{escape(entry.meaning)}</tg-spoiler>"
+                )
+            lines.append(
+                "<i>Score them: <code>/got word</code> · <code>/missed word</code></i>"
+            )
+
     lines.append("")
     lines.append("🎙️ <b>Teacher's Challenge:</b>")
     challenge = (
@@ -304,10 +483,16 @@ def render_daily_briefing(
     lines.append(f"🧱 <b>Answer frame:</b> {escape(answer_frame)}")
     lines.append(f"✨ <b>Band 8 phrase:</b> {escape(band8_phrase)}")
 
+    if settings.weekly_recap_enabled and now.weekday() == settings.weekly_recap_weekday:
+        lines.extend(_render_weekly_recap(store, persona, streak))
+
     task_text = "; ".join(tasks) if tasks else "None"
     lines.extend([_rule(), "💾 <b>5. State</b>"])
     if persona:
         lines.append(_persona_quote(persona, persona.closing_line))
+    trend_line = _render_trend_line(store)
+    if trend_line:
+        lines.append(trend_line)
     scanned = sum(len(items) for items in news_by_category.values())
     provider = (
         "Gemini"
@@ -323,7 +508,154 @@ def render_daily_briefing(
     lines.append(
         f"[PERSISTENCE: {now.strftime('%Y-%m-%d')} | Tasks Remaining: {escape(task_text)} | Current Project Focus: {escape(focus)}]"
     )
-    return _trim_briefing("\n".join(lines).strip())
+    return _trim_briefing("\n".join(lines).strip()), vocabulary
+
+
+def _streak_bar(streak: int) -> str:
+    """Seven-day dot bar so the streak reads at a glance."""
+    filled = max(0, min(7, streak))
+    return "🔥" * filled + "·" * (7 - filled)
+
+
+def _render_trend_line(store: StateStore) -> str:
+    """One line naming what kept coming back this week."""
+    terms = store.recurring_terms(within_days=7, min_hits=3, limit=3)
+    if not terms:
+        return ""
+    listed = ", ".join(f"{term} ×{count}" for term, count in terms)
+    return f"🔁 <i>Recurring this week: {escape(listed)}</i>"
+
+
+def _render_weekly_recap(
+    store: StateStore,
+    persona: PersonaProfile | None,
+    streak: int,
+) -> list[str]:
+    """Sunday-only section summarising the week from stored history."""
+    lines = [_rule(), "🗓️ <b>Weekly Recap</b>"]
+    if persona:
+        lines.append(_persona_quote(persona, "Seven days, measured."))
+
+    scanned = store.sent_count(within_days=7)
+    topics = store.topic_counts(within_days=7)
+    domains = store.domain_counts(within_days=7)
+    tasks = store.task_event_counts(within_days=7)
+    total_vocab, mastered = store.vocabulary_stats()
+
+    lines.append(f"📰 <b>Items delivered:</b> {scanned}")
+    if topics:
+        listed = " · ".join(f"{topic} {count}" for topic, count in topics[:4])
+        lines.append(f"🧭 <b>Category split:</b> {escape(listed)}")
+    if domains:
+        listed = " · ".join(f"{domain} {count}" for domain, count in domains[:3])
+        lines.append(f"📡 <b>Loudest sources:</b> {escape(listed)}")
+    terms = store.recurring_terms(within_days=7, min_hits=3, limit=5)
+    if terms:
+        listed = ", ".join(f"{term} ×{count}" for term, count in terms)
+        lines.append(f"🔁 <b>Themes that persisted:</b> {escape(listed)}")
+
+    lines.append(
+        "✅ <b>Task velocity:</b> "
+        f"{tasks.get('done', 0)} done · {tasks.get('blocked', 0)} blocked · "
+        f"{tasks.get('dropped', 0)} dropped · streak {streak}d"
+    )
+    lines.append(f"🎓 <b>Vocabulary:</b> {total_vocab} learned · {mastered} mastered")
+
+    recent = store.recent_task_events(limit=3)
+    if recent:
+        lines.append("🧾 <b>Latest entries:</b>")
+        for event in recent:
+            note = f" — {_shorten(event.note, 60)}" if event.note else ""
+            lines.append(
+                f"- {escape(event.day)} [{escape(event.status)}] "
+                f"{escape(_shorten(event.task, 60))}{escape(note)}"
+            )
+    return lines
+
+
+def _apply_item_takes(
+    settings: Settings,
+    news_by_category: dict[str, list[BriefingNewsItem]],
+    focus: str,
+    tasks: list[str],
+) -> dict[str, list[BriefingNewsItem]]:
+    """Attach an AI 'why it matters' line to the strongest items.
+
+    Only the top few items are enriched: each one costs an article fetch, and
+    the payoff drops fast below the fold.
+    """
+    if not settings.item_takes_enabled:
+        return news_by_category
+
+    use_gemini = settings.ai_provider == "gemini"
+    if use_gemini:
+        if not settings.gemini_api_key:
+            return news_by_category
+    elif not settings.openai_enabled or not settings.openai_api_key:
+        return news_by_category
+
+    ranked = sorted(
+        (
+            item
+            for items in news_by_category.values()
+            for item in items[:VISIBLE_NEWS_PER_CATEGORY]
+            if item.impact_score > 1
+        ),
+        key=lambda item: item.impact_score,
+        reverse=True,
+    )[: max(0, settings.item_takes_limit)]
+    if not ranked:
+        return news_by_category
+
+    requests = [
+        EnrichmentRequest(
+            url=item.url,
+            title=item.headline,
+            summary=item.summary,
+            category=item.category,
+        )
+        for item in ranked
+    ]
+    try:
+        context = build_take_context(
+            requests,
+            focus,
+            tasks,
+            settings.briefing_location,
+        )
+        if use_gemini:
+            payload = generate_item_takes_gemini(
+                settings.gemini_api_key,
+                settings.gemini_model,
+                context,
+            )
+        else:
+            payload = generate_item_takes(
+                settings.openai_api_key,
+                settings.openai_model,
+                context,
+            )
+        takes = parse_takes(payload, len(requests))
+    except Exception as exc:  # noqa: BLE001 - enrichment is strictly optional
+        _LOG.warning(
+            "item takes failed, rendering without them: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return news_by_category
+
+    by_url = {requests[index].url: text for index, text in takes.items()}
+    if not by_url:
+        return news_by_category
+    return {
+        category: [
+            replace(item, why_it_matters=by_url[item.url])
+            if item.url in by_url
+            else item
+            for item in items
+        ]
+        for category, items in news_by_category.items()
+    }
 
 
 def load_briefing_state(settings: Settings) -> BriefingState:
@@ -363,12 +695,18 @@ def load_briefing_state(settings: Settings) -> BriefingState:
     )
 
 
-def persist_briefing_state(settings: Settings) -> None:
-    now = datetime.now(ZoneInfo(settings.timezone))
-    state = load_briefing_state(settings)
+def save_briefing_state(
+    settings: Settings,
+    state: BriefingState,
+    last_date: str | None = None,
+) -> None:
+    """Write ``state`` back to disk, optionally stamping a new ``lastDate``."""
     payload = {
-        "lastDate": now.strftime("%Y-%m-%d"),
-        "tasksRemaining": state.tasks_remaining or list(settings.pending_tasks),
+        "lastDate": last_date or state.last_date or "",
+        # Written as-is: an empty list means "you finished everything", not
+        # "reseed from PENDING_TASKS". The old fallback resurrected closed
+        # tasks on the next write.
+        "tasksRemaining": state.tasks_remaining,
         "currentProjectFocus": state.current_project_focus
         or settings.current_project_focus,
         "streak": state.streak,
@@ -380,10 +718,26 @@ def persist_briefing_state(settings: Settings) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def persist_briefing_state(settings: Settings) -> None:
+    now = datetime.now(ZoneInfo(settings.timezone))
+    state = load_briefing_state(settings)
+    save_briefing_state(settings, state, last_date=now.strftime("%Y-%m-%d"))
+
+
 def _collect_category_news(
     settings: Settings,
     spec: BriefingCategorySpec,
+    memory: FeedMemory | None = None,
 ) -> list[BriefingNewsItem]:
+    """Gather, filter, score and rank one category.
+
+    Tavily is the primary source with Hacker News as a widening fallback. Both
+    paths now feed the same post-processing pass, so dedupe, mutes and
+    multi-factor scoring apply no matter where an item came from.
+    """
+    memory = memory or FeedMemory.empty()
+    candidates: list[BriefingNewsItem] = []
+
     if settings.tavily_enabled and settings.tavily_api_key:
         try:
             results = search_tavily(
@@ -393,7 +747,15 @@ def _collect_category_news(
                     topic=settings.tavily_topic,
                     time_range=settings.tavily_time_range,
                     search_depth=settings.tavily_search_depth,
-                    max_results=max(settings.news_items_per_category * 2, 5),
+                    # Over-fetch: dedupe and mutes discard a chunk of this, and
+                    # a thin pool is what used to force placeholder filler.
+                    max_results=max(settings.news_items_per_category * 4, 10),
+                    # Social and aggregator domains never carry the primary
+                    # story, and HN is already covered by its own collector.
+                    exclude_domains=TAVILY_EXCLUDED_DOMAINS
+                    + tuple(
+                        value for kind, value in memory.mutes if kind == "domain"
+                    ),
                 ),
             )
         except Exception as exc:
@@ -404,8 +766,8 @@ def _collect_category_news(
                 exc,
             )
             results = []
-        items = []
-        for result in results:
+        relevance = _normalized_tavily_scores(results)
+        for position, result in enumerate(results):
             if not _is_category_relevant(
                 spec,
                 result.title,
@@ -415,33 +777,141 @@ def _collect_category_news(
                 continue
             if _is_generic_url(result.url):
                 continue
-            items.append(
+            candidates.append(
                 BriefingNewsItem(
                     category=spec.key,
                     headline=result.title,
-                    impact_score=_impact_score(
-                        result.title,
-                        result.content,
-                        result.score,
-                        spec.keywords,
-                    ),
+                    impact_score=0,  # assigned by _rank_category below
                     url=result.url,
                     source=_source_label(result.url),
                     summary=result.content,
+                    tavily_score=relevance[position],
+                    published_at=_parse_published(result.published_date),
                 )
             )
-        if len(items) < settings.news_items_per_category:
-            seen_urls = {item.url for item in items}
-            for fallback in _hacker_news_fallback(settings, spec):
-                if fallback.url in seen_urls:
-                    continue
-                items.append(fallback)
-                if len(items) >= settings.news_items_per_category:
-                    break
-        if items:
-            return items[: settings.news_items_per_category]
 
-    return _hacker_news_fallback(settings, spec)
+    # Always top up from Hacker News. Previously this only ran when Tavily came
+    # up short, which meant HN's engagement signal was invisible on good days.
+    existing_urls = {item.url for item in candidates}
+    for item in _hacker_news_fallback(settings, spec):
+        if item.url in existing_urls:
+            continue
+        existing_urls.add(item.url)
+        candidates.append(item)
+
+    return _rank_category(settings, spec, candidates, memory)
+
+
+def _rank_category(
+    settings: Settings,
+    spec: BriefingCategorySpec,
+    candidates: list[BriefingNewsItem],
+    memory: FeedMemory,
+) -> list[BriefingNewsItem]:
+    """Drop muted/duplicate items, score the rest, return the best first."""
+    clusters = _cluster_stories(candidates)
+    corroboration = _corroboration_counts(candidates, clusters)
+    scored: list[BriefingNewsItem] = []
+    seen_clusters: set[int] = set()
+
+    for item, cluster in zip(candidates, clusters):
+        if memory.is_muted(item.headline, item.url):
+            continue
+        key = _make_key(item.category, item.url, item.headline)
+        if key in memory.recent_keys:
+            # Already sent inside the repeat window; this is the dedupe that
+            # dev_ielts mode never actually applied.
+            continue
+        if cluster in seen_clusters:
+            # Same story from another outlet: it already counted towards
+            # corroboration, so showing it again is just repetition.
+            continue
+        seen_clusters.add(cluster)
+        hits = corroboration.get(cluster, 1)
+        scored.append(
+            BriefingNewsItem(
+                category=item.category,
+                headline=item.headline,
+                impact_score=_impact_score(item, spec.keywords, memory, hits),
+                url=item.url,
+                source=item.source,
+                summary=item.summary,
+                tavily_score=item.tavily_score,
+                published_at=item.published_at,
+                hn_points=item.hn_points,
+                hn_comments=item.hn_comments,
+                corroboration=hits,
+            )
+        )
+
+    scored.sort(key=lambda item: item.impact_score, reverse=True)
+    return scored[: max(settings.news_items_per_category, VISIBLE_NEWS_PER_CATEGORY)]
+
+
+def _cluster_stories(items: list[BriefingNewsItem]) -> list[int]:
+    """Group items that tell the same story; returns a cluster id per item.
+
+    Outlets rarely agree word for word — "Apple's M5 Ultra benchmarks leak"
+    and "M5 Ultra Benchmarks Leak | Reuters" share most but not all of their
+    terms — so exact fingerprints miss almost every real duplicate. Greedy
+    Jaccard clustering over the meaningful tokens catches them instead.
+    """
+    cluster_tokens: list[frozenset[str]] = []
+    assignments: list[int] = []
+    for item in items:
+        tokens = _story_tokens(item.headline)
+        match = -1
+        for index, existing in enumerate(cluster_tokens):
+            if _jaccard(tokens, existing) >= STORY_MATCH_THRESHOLD:
+                match = index
+                break
+        if match < 0:
+            cluster_tokens.append(tokens)
+            match = len(cluster_tokens) - 1
+        assignments.append(match)
+    return assignments
+
+
+def _corroboration_counts(
+    items: list[BriefingNewsItem],
+    clusters: list[int],
+) -> dict[int, int]:
+    """How many distinct domains carry each clustered story.
+
+    Two outlets running the same story is real signal; one aggregator
+    repeating itself is not, so domains are counted uniquely.
+    """
+    domains: dict[int, set[str]] = {}
+    for item, cluster in zip(items, clusters):
+        domains.setdefault(cluster, set()).add(_domain_of(item.url))
+    return {cluster: len(hosts) for cluster, hosts in domains.items()}
+
+
+def _story_tokens(headline: str) -> frozenset[str]:
+    """Meaningful words of a headline, with the outlet suffix removed."""
+    stripped = re.split(r"\s+[-–—|]\s+", headline.strip())[0]
+    return frozenset(
+        word
+        for word in _SIGNATURE_SPLIT.split(stripped.lower())
+        if len(word) > 3 and word not in _SIGNATURE_STOPWORDS
+    )
+
+
+def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = len(left | right)
+    return len(left & right) / union if union else 0.0
+
+
+def _focus_terms(state: BriefingState, settings: Settings) -> tuple[str, ...]:
+    """Meaningful words from the project focus, used as a relevance boost."""
+    focus = state.current_project_focus or settings.current_project_focus
+    pending = " ".join(state.tasks_remaining)
+    words = _SIGNATURE_SPLIT.split(f"{focus} {pending}".lower())
+    return tuple(
+        {word for word in words if len(word) > 3 and word not in _SIGNATURE_STOPWORDS}
+    )
 
 
 def _hacker_news_fallback(
@@ -452,38 +922,28 @@ def _hacker_news_fallback(
     hn_items = collect_hacker_news(limit=max(settings.hacker_news_limit, 10))
     for item in hn_items:
         haystack = f"{item.title} {item.summary}".lower()
-        if not any(keyword in haystack for keyword in spec.keywords):
+        if not _contains_any_term(haystack, spec.keywords):
             continue
         fallback_items.append(
             BriefingNewsItem(
                 category=spec.key,
                 headline=item.title,
-                impact_score=max(5, min(9, int(item.score_hint + 5))),
+                impact_score=0,
                 url=item.url,
                 source=item.source,
                 summary=item.summary,
+                hn_points=_safe_int(item.metadata.get("score")),
+                hn_comments=_safe_int(item.metadata.get("comments")),
+                published_at=item.published_at,
             )
         )
-        if len(fallback_items) >= settings.news_items_per_category:
-            break
 
-    if spec.key == "gaming" and len(fallback_items) < settings.news_items_per_category:
+    if spec.key == "gaming":
+        # Generic HN rarely carries game-dev stories; widen with a targeted
+        # search rather than padding the section with placeholders.
         used_urls = {item.url for item in fallback_items}
-        for fallback in _hacker_news_search_fallback(settings, spec, used_urls):
-            fallback_items.append(fallback)
-            if len(fallback_items) >= settings.news_items_per_category:
-                break
-
-    while spec.key == "gaming" and len(fallback_items) < settings.news_items_per_category:
-        fallback_items.append(
-            BriefingNewsItem(
-                category=spec.key,
-                headline="No additional high-impact game-dev item found; HN fallback checked",
-                impact_score=1,
-                url="https://news.ycombinator.com/",
-                source="Hacker News",
-                summary="Placeholder used to avoid irrelevant sports or general news.",
-            )
+        fallback_items.extend(
+            _hacker_news_search_fallback(settings, spec, used_urls)
         )
     return fallback_items
 
@@ -529,14 +989,22 @@ def _hacker_news_search_fallback(
             if not any(keyword in haystack for keyword in spec.keywords):
                 continue
             used_urls.add(story_url)
+            created = hit.get("created_at_i")
             hits.append(
                 BriefingNewsItem(
                     category=spec.key,
-                    headline=f"{title} (HN search fallback)",
-                    impact_score=5,
+                    headline=title,
+                    impact_score=0,
                     url=story_url,
                     source="Hacker News",
-                    summary=f"Hacker News fallback query: {query}",
+                    summary=str(hit.get("story_text") or "").strip(),
+                    hn_points=_safe_int(hit.get("points")),
+                    hn_comments=_safe_int(hit.get("num_comments")),
+                    published_at=(
+                        datetime.fromtimestamp(int(created), tz=timezone.utc)
+                        if isinstance(created, (int, float))
+                        else None
+                    ),
                 )
             )
     return hits
@@ -555,18 +1023,64 @@ def _safe_int(value: object, default: int = 0) -> int:
 
 
 def _impact_score(
-    title: str,
-    content: str,
-    tavily_score: float,
+    item: BriefingNewsItem,
     keywords: tuple[str, ...],
+    memory: FeedMemory,
+    corroboration: int,
 ) -> int:
-    score = 5 + round(max(0.0, min(tavily_score, 1.0)) * 4)
-    haystack = f"{title} {content}".lower()
-    if any(keyword in haystack for keyword in keywords):
-        score += 1
-    if any(source in haystack for source in SOURCE_HINTS):
-        score += 1
-    return max(1, min(10, score))
+    """Blend every available signal into a 1-10 score.
+
+    The old version only had Tavily's relevance plus two flat bonuses, so in
+    practice it emitted 5 or 7 and nothing else. These factors are additive on
+    a float scale and only rounded at the end, which keeps the spread visible.
+    """
+    haystack = f"{item.headline} {item.summary}".lower()
+    title_url = f"{item.headline} {item.url}".lower()
+    score = 3.0
+
+    # Search relevance, when the item came from Tavily.
+    score += max(0.0, min(item.tavily_score, 1.0)) * 3.0
+
+    # Community engagement, when it came from Hacker News. Log-ish curve so a
+    # 900-point story does not swamp everything else.
+    if item.hn_points:
+        score += min(2.5, item.hn_points / 150.0)
+    if item.hn_comments:
+        score += min(1.0, item.hn_comments / 120.0)
+
+    # Freshness: full credit under 6h, fading to zero at 48h.
+    if item.published_at is not None:
+        age_hours = max(
+            0.0,
+            (datetime.now(timezone.utc) - item.published_at).total_seconds() / 3600.0,
+        )
+        score += max(0.0, min(1.5, (48.0 - age_hours) / 28.0))
+
+    if _contains_any_term(haystack, keywords):
+        score += 0.8
+    if any(hint in title_url for hint in SOURCE_HINTS):
+        score += 0.8
+
+    # Relevance to what the user is actually building right now.
+    if memory.focus_terms and _contains_any_term(title_url, memory.focus_terms):
+        score += 1.5
+
+    # Independent outlets carrying the same story.
+    if corroboration > 1:
+        score += min(1.5, (corroboration - 1) * 0.75)
+
+    # Learned preference from /more and /less.
+    score += memory.topic_feedback.get(item.category, 0.0)
+
+    # Source fatigue: a domain that already dominated the last week gets
+    # damped so one outlet cannot own the brief.
+    domain_hits = memory.domain_counts.get(_domain_of(item.url), 0)
+    if domain_hits >= 5:
+        score -= 1.5
+    elif domain_hits >= 3:
+        score -= 0.7
+
+    return max(1, min(10, round(score)))
 
 
 def _is_category_relevant(
@@ -579,6 +1093,14 @@ def _is_category_relevant(
     title_url = f"{title} {url}".lower()
     if any(keyword in haystack for keyword in REJECT_KEYWORDS.get(spec.key, ())):
         return False
+    if spec.key == "web_tech":
+        # This branch used to fall through to "return True", so market and
+        # politics wire copy landed in the developer section.
+        if _contains_any_term(title_url, MARKET_NOISE_TERMS) and not _contains_any_term(
+            title_url, WEB_TECH_TERMS
+        ):
+            return False
+        return _contains_any_term(title_url, WEB_TECH_TERMS)
     if spec.key == "hardware":
         hardware_terms = spec.keywords + (
             "m-series",
@@ -642,6 +1164,95 @@ def _is_generic_url(url: str) -> bool:
         return True
     generic_paths = {"news", "blog", "articles", "latest", "business", "technology"}
     return path.lower() in generic_paths
+
+
+_SIGNATURE_SPLIT = re.compile(r"[^a-z0-9]+")
+
+# Token overlap above which two headlines are treated as the same story.
+STORY_MATCH_THRESHOLD = 0.5
+
+# Words too common in headlines to identify a story.
+_SIGNATURE_STOPWORDS = frozenset(
+    {
+        "after",
+        "again",
+        "amid",
+        "announce",
+        "announces",
+        "best",
+        "could",
+        "first",
+        "from",
+        "have",
+        "here",
+        "into",
+        "just",
+        "latest",
+        "more",
+        "most",
+        "must",
+        "news",
+        "next",
+        "over",
+        "report",
+        "says",
+        "than",
+        "that",
+        "their",
+        "them",
+        "this",
+        "under",
+        "what",
+        "when",
+        "will",
+        "with",
+        "would",
+        "your",
+    }
+)
+
+
+def _normalized_tavily_scores(results: list) -> list[float]:
+    """Rescale Tavily relevance to 0-1 within a single response.
+
+    Tavily returns absolute scores around 0.01-0.05, so the old
+    ``min(score, 1.0) * 4`` term evaluated to zero for every item and the
+    relevance signal was silently discarded. Only the ordering inside one
+    response is meaningful, so normalise against that response's own range.
+    """
+    scores = [max(0.0, float(getattr(result, "score", 0.0))) for result in results]
+    if not scores:
+        return []
+    low, high = min(scores), max(scores)
+    if high - low < 1e-9:
+        # A flat response carries no ordering information; treat it as neutral
+        # rather than crowning an arbitrary winner.
+        return [0.5] * len(scores)
+    return [(score - low) / (high - low) for score in scores]
+
+
+def _parse_published(value: str | None) -> datetime | None:
+    """Parse Tavily's published_date, which arrives as RFC 2822 or ISO 8601."""
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed is not None:
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _domain_of(url: str) -> str:
+    try:
+        return parse.urlparse(url).netloc.lower().removeprefix("www.")
+    except ValueError:
+        return ""
 
 
 def _contains_any_term(text: str, terms: tuple[str, ...]) -> bool:

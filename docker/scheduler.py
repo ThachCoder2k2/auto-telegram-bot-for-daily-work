@@ -72,6 +72,31 @@ def _send_digest() -> int:
     return last_rc
 
 
+def _start_command_loop() -> subprocess.Popen | None:
+    """Run the Telegram command poller beside the scheduler.
+
+    A separate process rather than a thread: a wedged HTTP call in the poller
+    then cannot take the daily send down with it, and the supervisor below can
+    simply restart it.
+    """
+    if not _env_flag("COMMANDS_ENABLED", True):
+        print("[scheduler] command loop disabled", flush=True)
+        return None
+    print("[scheduler] starting command loop", flush=True)
+    return subprocess.Popen([sys.executable, "-m", "daily_intel_bot.main", "--serve"])
+
+
+def _supervise(poller: subprocess.Popen | None) -> subprocess.Popen | None:
+    """Restart the command loop if it exited."""
+    if poller is None or poller.poll() is None:
+        return poller
+    print(
+        f"[scheduler] command loop exited ({poller.returncode}); restarting",
+        flush=True,
+    )
+    return _start_command_loop()
+
+
 def main() -> None:
     tz = ZoneInfo(os.getenv("TIMEZONE", "Asia/Ho_Chi_Minh"))
     hour = _env_int("DAILY_SEND_HOUR", 8, 0, 23)
@@ -83,23 +108,30 @@ def main() -> None:
         flush=True,
     )
 
+    poller = _start_command_loop()
+
     if _env_flag("RUN_ON_START", False):
         _send_digest()
 
-    while True:
-        now = datetime.now(tz)
-        target = _next_run(now, hour, minute)
-        sleep_s = (target - now).total_seconds()
-        print(
-            f"[scheduler] next run {target.isoformat()} "
-            f"(sleep {int(sleep_s)}s)",
-            flush=True,
-        )
-        # Cap single sleep so a host clock/DST jump can't strand us for a full
-        # day; re-check the target each wake.
-        time.sleep(min(sleep_s, 3600))
-        if datetime.now(tz) >= target:
-            _send_digest()
+    try:
+        while True:
+            now = datetime.now(tz)
+            target = _next_run(now, hour, minute)
+            sleep_s = (target - now).total_seconds()
+            print(
+                f"[scheduler] next run {target.isoformat()} "
+                f"(sleep {int(sleep_s)}s)",
+                flush=True,
+            )
+            # Cap single sleep so a host clock/DST jump can't strand us for a
+            # full day, and so the poller is checked on regularly.
+            time.sleep(min(sleep_s, 300))
+            poller = _supervise(poller)
+            if datetime.now(tz) >= target:
+                _send_digest()
+    finally:
+        if poller is not None and poller.poll() is None:
+            poller.terminate()
 
 
 if __name__ == "__main__":

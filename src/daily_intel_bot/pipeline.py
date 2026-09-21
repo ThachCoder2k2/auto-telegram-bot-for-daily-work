@@ -83,13 +83,14 @@ def build_digest_bundle(settings: Settings) -> DigestBundle:
 
 def build_digest_text(settings: Settings) -> tuple[str, DigestBundle]:
     if settings.briefing_mode == "dev_ielts":
-        text, selected_items = build_daily_briefing(settings)
+        text, selected_items, vocabulary = build_daily_briefing(settings)
         bundle = DigestBundle(
             tech_items=[],
             ai_items=[],
             watchlist_items=[],
             stats_items=[],
             selected_items=selected_items,
+            vocabulary=vocabulary,
         )
         return text, bundle
 

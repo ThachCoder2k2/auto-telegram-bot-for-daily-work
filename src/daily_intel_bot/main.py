@@ -2,21 +2,15 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-from html import escape
 import sys
 from zoneinfo import ZoneInfo
 
-from daily_intel_bot.briefing import persist_briefing_state
 from daily_intel_bot.config import load_settings
+from daily_intel_bot.delivery import send_daily_digest
 from daily_intel_bot.obs import get_logger, setup_logging
-from daily_intel_bot.persona import (
-    select_persona,
-    select_persona_image,
-    select_persona_image_url,
-)
 from daily_intel_bot.pipeline import build_digest_text
-from daily_intel_bot.state_store import StateStore
-from daily_intel_bot.telegram_client import send_message, send_photo
+from daily_intel_bot.poller import run_command_loop
+from daily_intel_bot.telegram_client import send_message
 
 
 def build_sample_digest(timezone: str) -> str:
@@ -82,12 +76,21 @@ def main() -> None:
         action="store_true",
         help="Send the real digest built from live public sources.",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run the Telegram command loop (/done, /status, /quiz, …).",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
 
-    if args.send_test or args.send_sample_digest or args.send_digest:
+    if args.send_test or args.send_sample_digest or args.send_digest or args.serve:
         _require_telegram(settings)
+
+    if args.serve:
+        run_command_loop(settings)
+        return
 
     if args.send_test:
         result = send_message(settings, "Direct Telegram test message from Clawbot")
@@ -108,19 +111,13 @@ def main() -> None:
         return
 
     if args.send_digest:
-        digest, bundle = build_digest_text(settings)
-        photo_result = _send_persona_photo_if_enabled(settings)
-        if photo_result:
-            print("persona-image=ok")
-            print(f"photo_message_id={photo_result['result']['message_id']}")
-        result = send_message(settings, digest)
-        StateStore(settings.state_db_path).mark_sent(bundle.selected_items)
-        if settings.briefing_mode == "dev_ielts":
-            persist_briefing_state(settings)
+        delivered = send_daily_digest(settings)
+        if delivered.photo_message_id is not None:
+            print(f"persona-image=ok photo_message_id={delivered.photo_message_id}")
         print("direct-live-digest=ok")
-        if "message_ids" in result:
-            print(f"message_ids={','.join(str(value) for value in result['message_ids'])}")
-        print(f"message_id={result['result']['message_id']}")
+        print(f"message_ids={','.join(str(value) for value in delivered.message_ids)}")
+        print(f"items_sent={delivered.items_sent}")
+        print(f"vocabulary_added={delivered.vocabulary_added}")
         return
 
     print("daily-intel-bot scaffold ready")
@@ -163,48 +160,6 @@ def _configure_stdout() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
         pass
-
-
-def _send_persona_photo_if_enabled(settings) -> dict[str, object] | None:
-    if (
-        settings.briefing_mode != "dev_ielts"
-        or not settings.bot_persona_enabled
-        or not settings.bot_persona_image_enabled
-    ):
-        return None
-    now = datetime.now(ZoneInfo(settings.timezone))
-    persona = select_persona(
-        enabled=settings.bot_persona_enabled,
-        rotation=settings.bot_persona_rotation,
-        pool=settings.bot_persona_pool,
-        forced_key=settings.bot_persona_force,
-        now=now,
-    )
-    image_url = select_persona_image_url(
-        persona,
-        settings.bot_persona_image_urls_path,
-        now,
-    )
-    image_path = select_persona_image(persona, settings.bot_persona_image_dir, now)
-    if persona is None or (image_url is None and image_path is None):
-        print("persona-image=skipped")
-        return None
-    caption = (
-        f"{escape(persona.icon)} <b>{escape(persona.name)}</b> "
-        f"opens today's briefing."
-    )
-    if image_url:
-        try:
-            return send_photo(settings, image_url, caption=caption)
-        except Exception as exc:
-            print(f"persona-image-url=failed ({type(exc).__name__})")
-            if image_path is None:
-                return None
-    try:
-        return send_photo(settings, image_path, caption=caption)
-    except Exception as exc:
-        print(f"persona-image=failed ({type(exc).__name__})")
-        return None
 
 
 if __name__ == "__main__":

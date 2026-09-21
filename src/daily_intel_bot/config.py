@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         case_sensitive=False,
         extra="ignore",
+        # Local CLI runs read .env directly; real environment variables still
+        # win, so the container (which injects them via compose) is unaffected.
+        env_file=".env",
+        env_file_encoding="utf-8",
     )
 
     briefing_mode: str = "dev_ielts"
@@ -67,6 +71,19 @@ class Settings(BaseSettings):
     ai_item_limit: int = 3
     watchlist_item_limit: int = 3
     state_db_path: str = ""
+    # How long an already-sent story stays suppressed.
+    repeat_window_days: int = 5
+    # Two-way command loop.
+    commands_enabled: bool = True
+    command_poll_seconds: int = 30
+    # Weekly recap section; 6 = Sunday in Python's weekday numbering.
+    weekly_recap_enabled: bool = True
+    weekly_recap_weekday: int = 6
+    vocab_review_enabled: bool = True
+    vocab_review_limit: int = 3
+    # Per-item "why it matters" enrichment via the AI backend.
+    item_takes_enabled: bool = True
+    item_takes_limit: int = 3
     tavily_api_key: str | None = None
     tavily_enabled: bool = True
     tavily_max_results: int = 4

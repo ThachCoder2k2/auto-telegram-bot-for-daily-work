@@ -35,3 +35,6 @@ class DigestBundle:
     watchlist_items: list[SignalItem]
     stats_items: list[StatItem]
     selected_items: list[SignalItem]
+    # (word, meaning, example) triples to push into spaced repetition once the
+    # brief has actually been delivered.
+    vocabulary: tuple[tuple[str, str, str], ...] = ()

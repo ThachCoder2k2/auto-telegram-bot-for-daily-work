@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import json
 from urllib import request
 
+from daily_intel_bot.enrich import TAKES_INSTRUCTIONS, takes_response_schema
+
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 USER_AGENT = "clawbot-daily-intel-telegram/0.1"
@@ -94,6 +96,50 @@ def generate_ai_briefing_sections(
     if not text:
         raise ValueError("OpenAI response did not include output text")
     return _parse_sections(json.loads(text))
+
+
+def generate_item_takes(
+    api_key: str,
+    model: str,
+    context: dict[str, object],
+) -> dict[str, object]:
+    """Ask OpenAI for one 'why it matters' line per news item."""
+    body = {
+        "model": model,
+        "instructions": TAKES_INSTRUCTIONS,
+        "input": json.dumps(context, ensure_ascii=False),
+        "max_output_tokens": 900,
+        "text": {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "daily_intel_item_takes",
+                "strict": True,
+                "schema": takes_response_schema(),
+            },
+        },
+    }
+    payload = json.dumps(body).encode("utf-8")
+    req = request.Request(
+        OPENAI_RESPONSES_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    with request.urlopen(req, timeout=45) as resp:
+        response_payload = json.loads(resp.read().decode("utf-8"))
+
+    text = _extract_output_text(response_payload)
+    if not text:
+        raise ValueError("OpenAI response did not include output text")
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("OpenAI takes response was not a JSON object")
+    return parsed
 
 
 def _response_schema() -> dict[str, object]:

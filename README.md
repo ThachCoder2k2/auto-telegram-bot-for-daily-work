@@ -26,7 +26,9 @@ Edit `.env` to decide what the daily run fetches and how the briefing is framed:
 - `CURRENT_PROJECT_FOCUS`
   Default: `Godot horror-platformer`
 - `PENDING_TASKS`
-  Comma-separated tasks used by the Continuity Tracker
+  Comma-separated tasks, used **only to seed** the list on first run. After
+  that `state/briefing_state.json` is authoritative and `/done`, `/task` and
+  `/drop` drive it — a finished task is not resurrected from this variable.
 - `ENABLED_CATEGORIES`
   Values: `web_tech`, `hardware`, `gaming`, `governance`
 - `NEWS_ITEMS_PER_CATEGORY`
@@ -51,17 +53,25 @@ Example:
 
 ```env
 BRIEFING_MODE=dev_ielts
-BRIEFING_LOCATION=Hanoi, Vietnam
-CURRENT_PROJECT_FOCUS=Godot horror-platformer
-PENDING_TASKS=Prototype one horror-platformer mechanic in Godot
+BRIEFING_LOCATION="Hanoi, Vietnam"
+CURRENT_PROJECT_FOCUS="Godot horror-platformer"
+PENDING_TASKS="Prototype one horror-platformer mechanic in Godot"
 ENABLED_CATEGORIES=web_tech,hardware,gaming,governance
 NEWS_ITEMS_PER_CATEGORY=5
 ```
+
+Quote values containing spaces or commas: several `.env` parsers stop at the
+first unquoted space and silently drop every later line, which reads as
+"my API key isn't loading".
 
 That generates the 5-module briefing: news table, inspiration lab, continuity tracker, IELTS section, and persistence tag.
 
 ## Local commands
 
+- `daily-intel-bot` — print the active configuration
+- `daily-intel-bot --print-digest` — preview the live brief without sending
+- `daily-intel-bot --send-digest` — build and send today's brief
+- `daily-intel-bot --serve` — run the Telegram command loop
 - `scripts/show-fetch-config.ps1`: print the active fetch controls
 - `scripts/print-daily-digest.ps1`: preview the live digest
 - `scripts/send-daily-digest.ps1`: send the live Telegram digest
@@ -83,6 +93,84 @@ Telegram formatting uses plain-text blocks instead of markdown tables:
 - top item in each category includes its article link
 - numbered headlines with `[Impact/10 Label]`
 - compact IELTS vocabulary bullets for mobile readability
+
+## Talking back to the bot
+
+The brief is two-way. A poller (`daily-intel-bot --serve`, started automatically
+by the Docker scheduler) reads replies from `TELEGRAM_CHAT_ID` and writes them
+into `state/briefing_state.json` and the SQLite store, so the next brief
+reflects what you answered. Messages from any other chat are ignored.
+
+**Task flow**
+- `/done [note]` — close the current task, extend the streak, promote the next one
+- `/blocked <reason>` — record what stopped you; tomorrow's brief leads with it
+- `/task [text]` — list the queue, or put new work on top
+- `/drop` — abandon the current task without breaking the streak
+- `/focus <text>` — change the project lens used for ranking and ideas
+
+**Tuning the feed**
+- `/skip <domain|word>` — mute a source or topic permanently
+- `/unmute <value>`, `/mutes`
+- `/more <category>`, `/less <category>` — nudge a category's ranking weight
+
+**IELTS**
+- `/quiz` — review words whose spaced-repetition interval has elapsed
+- `/got <word>`, `/missed <word>` — score a review
+
+**Other**
+- `/status` — streak, tasks, 7-day trends, vocabulary progress
+- `/digest` — send today's brief immediately
+- `/help`
+
+Bare `done`, `blocked …` and `status` work too. Any other plain text is filed
+as a note against the current task.
+
+Streaks are derived from the task-event log rather than stored, so a corrected
+entry can never leave a stale counter behind.
+
+Knobs: `COMMANDS_ENABLED`, `COMMAND_POLL_SECONDS`.
+
+## How items are ranked
+
+`impact_score` blends several signals on a float scale and rounds once at the
+end, so the 1-10 spread is real:
+
+- Tavily relevance, **normalised within each response** — Tavily's absolute
+  scores sit around 0.01-0.05, so comparing them to 1.0 discarded the signal
+- Hacker News points and comment count
+- Freshness: full credit under 6h, fading out by 48h
+- Category keyword and known-good-source matches
+- Overlap with `CURRENT_PROJECT_FOCUS` and your pending tasks
+- Cross-source corroboration — how many *distinct domains* carry the story
+- Your `/more` and `/less` weights
+- Source fatigue: a domain that dominated the last week is damped
+
+Items already sent within `REPEAT_WINDOW_DAYS` are dropped, and headlines are
+clustered by token overlap so the same story from three outlets appears once,
+marked `[×3 sources]`, instead of three times.
+
+## Memory and recap
+
+The SQLite store keeps every delivered item, task event and vocabulary word.
+
+- Every brief ends with a `Recurring this week` line
+- On Sundays (`WEEKLY_RECAP_WEEKDAY=6`) a Weekly Recap section reports items
+  delivered, category split, loudest sources, persistent themes, task velocity
+  and vocabulary progress
+- IELTS words enter a five-box Leitner schedule (1/2/4/8/16 days) and resurface
+  in the brief under `Recall from earlier days`
+
+Knobs: `REPEAT_WINDOW_DAYS`, `WEEKLY_RECAP_ENABLED`, `WEEKLY_RECAP_WEEKDAY`,
+`VOCAB_REVIEW_ENABLED`, `VOCAB_REVIEW_LIMIT`.
+
+## Why each item matters
+
+For the top `ITEM_TAKES_LIMIT` items the bot fetches the article body and asks
+the AI backend for one sentence on what it means for your current project,
+rendered as a `💡` line. Enrichment is best-effort: a slow outlet or a
+rate-limited model degrades the brief instead of blocking it.
+
+Knobs: `ITEM_TAKES_ENABLED`, `ITEM_TAKES_LIMIT`.
 
 ## Source mix
 
