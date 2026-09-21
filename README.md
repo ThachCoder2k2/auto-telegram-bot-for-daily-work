@@ -130,6 +130,61 @@ entry can never leave a stale counter behind.
 
 Knobs: `COMMANDS_ENABLED`, `COMMAND_POLL_SECONDS`.
 
+## Notion tasks and reminders
+
+The bot reads an unfinished-task board from Notion, shows it in the brief
+beside its own micro-task, and can tick tasks back to Done.
+
+**Setup**
+1. Settings → *Nhà phát triển* (Developers) → **Token mới**, capability
+   *Notion API*. Copy the `ntn_...` token into `NOTION_TOKEN`.
+2. Copy the 32 hex characters from the database URL (between the last `/` and
+   the `?`) into `NOTION_DATABASE_ID`. The `v=` part is a view id, not the
+   database.
+3. Open the database → `...` → **Connections** → add the integration. Skipping
+   this returns `404 object_not_found` even with a valid token — the error the
+   client rewrites into a readable message.
+
+Since API version `2025-09-03` a database id cannot be queried directly: it
+resolves to a *data source* id first, which the client caches in the `meta`
+table. Requests pin `Notion-Version: 2026-03-11`.
+
+**Column detection** — property names are read from the live schema rather than
+hard-coded, matching on type plus a name hint: `title` → task name, `status`
+(or a `checkbox` named done/complete) → state, `select` named priority,
+estimated/time, frequency, and a `date` named remind. Override with
+`NOTION_PROP_STATUS`, `NOTION_PROP_PRIORITY`, `NOTION_PROP_LAST_REMINDED` when
+a guess is wrong. The "done" option follows the board's own wording, so a
+column using *Completed* still works.
+
+**Ordering** — a board without a due-date column cannot be sorted by deadline,
+so tasks sort by Priority, then by Estimated Time (quickest win first, since a
+15-minute task is easier to actually start), then by title.
+
+**Commands**
+- `/ntasks` — numbered list of unfinished tasks
+- `/ndone <n>` — set task n to Done in Notion
+
+The numbering is persisted in the `meta` table, so `/ndone 2` still resolves
+after the message scrolls away. `/done` is deliberately *not* wired to Notion:
+it closes the bot's own micro-task and drives the streak, while Notion holds
+the project backlog.
+
+**Reminder engine** — the board's `Reminder`, `Reminder Frequency` and
+`Last Reminded` columns only mean something once a process compares them to the
+clock. The command poller does that every `NOTION_REMINDER_CHECK_SECONDS`:
+a task with `Reminder` ticked and a frequency of *Once / Every hour / Every 2
+hours / Every 4 hours / Every day / Every week* is nudged when its interval has
+elapsed, then `Last Reminded` is stamped so the interval advances. Unknown
+frequency values never fire, so adding an option in Notion cannot turn into
+hourly spam.
+
+Nudges are held outside `NOTION_QUIET_START`–`NOTION_QUIET_END`; one that comes
+due overnight fires at the first check after the window opens. A window that
+wraps midnight (22→6) is treated as a union, not an empty range.
+
+Notion being down costs the task block and the nudges, never the brief.
+
 ## How items are ranked
 
 `impact_score` blends several signals on a float scale and rounds once at the

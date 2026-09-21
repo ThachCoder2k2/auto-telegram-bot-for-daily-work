@@ -84,6 +84,22 @@ class Settings(BaseSettings):
     # Per-item "why it matters" enrichment via the AI backend.
     item_takes_enabled: bool = True
     item_takes_limit: int = 3
+    # --- Notion tasks ---
+    notion_enabled: bool = False
+    notion_token: str | None = None
+    notion_database_id: str = ""
+    notion_task_limit: int = 5
+    notion_write_enabled: bool = True
+    notion_reminders_enabled: bool = True
+    # Nudges are held outside these hours so an "Every hour" task cannot wake
+    # the user at 03:00; a reminder that came due overnight fires at the open.
+    notion_quiet_start: int = 8
+    notion_quiet_end: int = 22
+    notion_reminder_check_seconds: int = 300
+    # Overrides for when schema auto-detection picks the wrong column.
+    notion_prop_status: str = ""
+    notion_prop_priority: str = ""
+    notion_prop_last_reminded: str = ""
     tavily_api_key: str | None = None
     tavily_enabled: bool = True
     tavily_max_results: int = 4

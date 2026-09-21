@@ -21,8 +21,11 @@ from daily_intel_bot.briefing import (
     load_briefing_state,
     save_briefing_state,
 )
+from daily_intel_bot import notion_tasks
 from daily_intel_bot.config import Settings
+from daily_intel_bot.notion_client import NotionError
 from daily_intel_bot.obs import get_logger
+from daily_intel_bot.reminders import render_task_line
 from daily_intel_bot.state_store import StateStore, current_streak
 
 
@@ -354,6 +357,67 @@ def _review_word(settings: Settings, argument: str, correct: bool) -> CommandRes
     )
 
 
+# --- Notion ---------------------------------------------------------------
+
+
+def _cmd_ntasks(settings: Settings, argument: str) -> CommandResult:
+    if not notion_tasks.is_configured(settings):
+        return CommandResult(
+            reply="🔌 Notion chưa bật. Đặt NOTION_ENABLED, NOTION_TOKEN, NOTION_DATABASE_ID."
+        )
+    store = StateStore(settings.state_db_path)
+    try:
+        board = notion_tasks.load_board(settings, store)
+    except NotionError as exc:
+        return CommandResult(reply=f"📛 Notion: {escape(str(exc))}")
+
+    if not board.tasks:
+        return CommandResult(reply="🎉 Notion sạch — không còn việc nào chưa xong.")
+
+    shown = board.tasks[: settings.notion_task_limit]
+    # Persist the order so /ndone <n> still resolves after this message
+    # scrolls out of view.
+    notion_tasks.remember_task_order(store, shown)
+    lines = [f"📥 <b>Notion — {len(board.tasks)} việc chưa xong</b>", ""]
+    lines.extend(render_task_line(index, task) for index, task in enumerate(shown, 1))
+    if len(board.tasks) > len(shown):
+        lines.append(f"<i>+{len(board.tasks) - len(shown)} việc nữa</i>")
+    lines.append("")
+    lines.append("Xong việc nào: <code>/ndone &lt;số&gt;</code>")
+    return CommandResult(reply="\n".join(lines))
+
+
+def _cmd_ndone(settings: Settings, argument: str) -> CommandResult:
+    if not notion_tasks.is_configured(settings):
+        return CommandResult(reply="🔌 Notion chưa bật.")
+    try:
+        number = int(argument.strip())
+    except (TypeError, ValueError):
+        return CommandResult(
+            reply="✍️ Dùng: <code>/ndone 2</code> (số lấy từ /ntasks)"
+        )
+
+    store = StateStore(settings.state_db_path)
+    page_id = notion_tasks.resolve_task_number(store, number)
+    if not page_id:
+        return CommandResult(
+            reply=f"🤷 Không có việc số {number}. Chạy /ntasks để lấy danh sách mới."
+        )
+    try:
+        board = notion_tasks.load_board(settings, store)
+        notion_tasks.complete_task(settings, board.schema, page_id)
+    except NotionError as exc:
+        return CommandResult(reply=f"📛 Notion: {escape(str(exc))}")
+
+    title = next(
+        (task.title for task in board.tasks if task.page_id == page_id),
+        f"việc #{number}",
+    )
+    return CommandResult(
+        reply=f"✅ Đã tick <b>{escape(title)}</b> sang Done trong Notion."
+    )
+
+
 # --- reporting ------------------------------------------------------------
 
 
@@ -422,6 +486,10 @@ def _help_text() -> str:
             "/quiz — review words that are due",
             "/got &lt;word&gt; · /missed &lt;word&gt;",
             "",
+            "<b>Notion</b>",
+            "/ntasks — list unfinished tasks from the board",
+            "/ndone &lt;n&gt; — tick task n as Done in Notion",
+            "",
             "<b>Other</b>",
             "/status — streak, tasks, trends",
             "/digest — send today's brief now",
@@ -450,6 +518,8 @@ _HANDLERS = {
     "/quiz": _cmd_quiz,
     "/got": _cmd_got,
     "/missed": _cmd_missed,
+    "/ntasks": _cmd_ntasks,
+    "/ndone": _cmd_ndone,
     "/status": _cmd_status,
     "/digest": _cmd_digest,
     "/help": _cmd_help,

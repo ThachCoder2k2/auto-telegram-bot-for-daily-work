@@ -8,12 +8,16 @@ silently turns every command the user sends into a no-op.
 
 from __future__ import annotations
 
+from datetime import datetime
 import time
+from zoneinfo import ZoneInfo
 
 from daily_intel_bot.commands import handle_command
 from daily_intel_bot.config import Settings
 from daily_intel_bot.delivery import send_daily_digest
+from daily_intel_bot.notion_tasks import load_board_quietly, stamp_reminded
 from daily_intel_bot.obs import get_logger
+from daily_intel_bot.reminders import ReminderWindow, due_reminders, render_reminder
 from daily_intel_bot.state_store import StateStore
 from daily_intel_bot.telegram_client import send_message
 from daily_intel_bot.telegram_updates import (
@@ -42,6 +46,7 @@ def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
     _LOG.info("command loop up (offset=%d)", offset)
 
     cycles = 0
+    last_reminder_check = 0.0
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
         try:
@@ -56,9 +61,51 @@ def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
             if next_offset != offset:
                 offset = next_offset
                 store.set_meta(OFFSET_META_KEY, str(offset))
+
+            # The poll already wakes every ~30s, so reminders ride along on
+            # this loop instead of needing a second scheduler.
+            if (
+                time.monotonic() - last_reminder_check
+                >= settings.notion_reminder_check_seconds
+            ):
+                last_reminder_check = time.monotonic()
+                send_due_reminders(settings, store)
         except Exception as exc:  # noqa: BLE001 - the loop must outlive failures
             _LOG.exception("command loop error: %s", type(exc).__name__)
             time.sleep(ERROR_SLEEP_SECONDS)
+
+
+def send_due_reminders(settings: Settings, store: StateStore) -> int:
+    """Nudge every Notion task whose reminder interval has elapsed.
+
+    Returns the number sent. Each nudge stamps ``Last Reminded`` so the
+    interval actually advances; a task whose stamp fails is simply nudged
+    again next cycle.
+    """
+    if not settings.notion_reminders_enabled:
+        return 0
+    board = load_board_quietly(settings, store)
+    if board is None:
+        return 0
+
+    now = datetime.now(ZoneInfo(settings.timezone))
+    window = ReminderWindow(
+        start_hour=settings.notion_quiet_start,
+        end_hour=settings.notion_quiet_end,
+    )
+    due = due_reminders(board.tasks, now, window)
+    sent = 0
+    for task in due:
+        try:
+            send_message(settings, render_reminder(task))
+        except Exception as exc:  # noqa: BLE001 - one bad nudge must not stop the rest
+            _LOG.warning("reminder send failed for %s: %s", task.title, exc)
+            continue
+        stamp_reminded(settings, board.schema, task.page_id, now)
+        sent += 1
+    if sent:
+        _LOG.info("sent %d Notion reminder(s)", sent)
+    return sent
 
 
 def _dispatch(settings: Settings, text: str) -> None:

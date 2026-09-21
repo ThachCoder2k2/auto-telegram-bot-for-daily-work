@@ -29,8 +29,10 @@ from daily_intel_bot.gemini_client import (
     generate_ai_briefing_sections_gemini,
     generate_item_takes_gemini,
 )
+from daily_intel_bot.notion_tasks import load_board_quietly, remember_task_order
 from daily_intel_bot.obs import get_logger, is_transient_http_error, with_retries
 from daily_intel_bot.persona import PersonaProfile, persona_intro, select_persona
+from daily_intel_bot.reminders import render_task_line
 from daily_intel_bot.state_store import StateStore, current_streak
 from daily_intel_bot.tavily_client import TavilySearchSpec, search_tavily
 
@@ -426,6 +428,7 @@ def render_daily_briefing(
             f"{weekly.get('done', 0)} done · {weekly.get('blocked', 0)} blocked · "
             f"{weekly.get('dropped', 0)} dropped"
         )
+    lines.extend(_render_notion_block(settings, store))
     lines.append(
         "❓ <b>Reply:</b> <code>/done</code> · <code>/blocked why</code> · "
         "<code>/task new thing</code> · <code>/help</code>"
@@ -509,6 +512,27 @@ def render_daily_briefing(
         f"[PERSISTENCE: {now.strftime('%Y-%m-%d')} | Tasks Remaining: {escape(task_text)} | Current Project Focus: {escape(focus)}]"
     )
     return _trim_briefing("\n".join(lines).strip()), vocabulary
+
+
+def _render_notion_block(settings: Settings, store: StateStore) -> list[str]:
+    """The Notion board, shown beside the bot's own micro-task.
+
+    Deliberately a separate block: the bot's task drives the streak, while
+    Notion holds the real project backlog. Merging them would make /done
+    ambiguous.
+    """
+    board = load_board_quietly(settings, store)
+    if board is None or not board.tasks:
+        return []
+    shown = board.tasks[: settings.notion_task_limit]
+    # Remember the numbering so /ndone <n> still resolves tomorrow.
+    remember_task_order(store, shown)
+    lines = ["", f"📥 <b>Notion — {len(board.tasks)} việc chưa xong</b>"]
+    lines.extend(render_task_line(index, task) for index, task in enumerate(shown, 1))
+    if len(board.tasks) > len(shown):
+        lines.append(f"   <i>+{len(board.tasks) - len(shown)} việc nữa</i>")
+    lines.append("   <i>Xong việc nào: <code>/ndone &lt;số&gt;</code></i>")
+    return lines
 
 
 def _streak_bar(streak: int) -> str:
