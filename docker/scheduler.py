@@ -38,11 +38,38 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def now_past_target(tz: ZoneInfo, hour: int, minute: int) -> bool:
+    """True when today's send time is already behind us."""
+    now = datetime.now(tz)
+    return now > now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
 def _next_run(now: datetime, hour: int, minute: int) -> datetime:
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
     return target
+
+
+def _catch_up_if_missed() -> None:
+    """Send today's brief if its time has passed and it never went out.
+
+    Restarting after the send time used to skip the whole day, so a redeploy
+    at 10:00 silently cost that day's brief. The send is idempotent — it
+    checks the recorded delivery stamp — so trying on every start is safe.
+    """
+    print("[scheduler] checking whether today's brief was missed", flush=True)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "daily_intel_bot.main",
+            "--send-digest",
+            "--if-missed",
+        ],
+        check=False,
+    )
+    print(f"[scheduler] catch-up exit={proc.returncode}", flush=True)
 
 
 def _send_digest() -> int:
@@ -112,6 +139,8 @@ def main() -> None:
 
     if _env_flag("RUN_ON_START", False):
         _send_digest()
+    elif _env_flag("CATCH_UP_ON_START", True) and now_past_target(tz, hour, minute):
+        _catch_up_if_missed()
 
     try:
         while True:

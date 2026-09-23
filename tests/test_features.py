@@ -612,3 +612,62 @@ def test_garbage_retry_after_falls_back_to_the_default_backoff():
 
     exc = HTTPError("u", 429, "slow down", {"Retry-After": "soon"}, None)
     assert _delay_for(exc, backoff=2.0, attempt=1) == RATE_LIMIT_BACKOFF_SECONDS
+
+
+# --- per-item takes -------------------------------------------------------
+
+
+def _take_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setenv("BRIEFING_STATE_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setenv("AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    monkeypatch.setenv("ITEM_TAKES_ENABLED", "true")
+    return Settings()
+
+
+def _take_item(url="https://example.com/a"):
+    return briefing.BriefingNewsItem(
+        category="web_tech",
+        headline="Rust 1.90 released",
+        impact_score=7,
+        url=url,
+        source="example.com",
+        summary="A summary long enough to be useful as an excerpt.",
+    )
+
+
+def test_item_takes_attach_to_the_matching_item(monkeypatch, tmp_path):
+    """Covers the success path, which a NameError had been crashing."""
+    settings = _take_settings(monkeypatch, tmp_path)
+    monkeypatch.setattr(briefing, "fetch_article_text", lambda _u: "body", raising=False)
+    monkeypatch.setattr(
+        briefing,
+        "build_take_context",
+        lambda reqs, focus, tasks, loc: {"items": []},
+    )
+    monkeypatch.setattr(
+        briefing,
+        "generate_item_takes_gemini",
+        lambda *a: {"takes": [{"id": 0, "why_it_matters": "Faster builds for you."}]},
+    )
+    news = {"web_tech": [_take_item()]}
+    out = briefing._apply_item_takes(settings, news, "Godot", ["ship it"])
+    assert out["web_tech"][0].why_it_matters == "Faster builds for you."
+
+
+def test_item_takes_failure_leaves_the_brief_intact(monkeypatch, tmp_path):
+    settings = _take_settings(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        briefing,
+        "build_take_context",
+        lambda reqs, focus, tasks, loc: {"items": []},
+    )
+
+    def _boom(*_a):
+        raise RuntimeError("model down")
+
+    monkeypatch.setattr(briefing, "generate_item_takes_gemini", _boom)
+    news = {"web_tech": [_take_item()]}
+    out = briefing._apply_item_takes(settings, news, "Godot", [])
+    assert out["web_tech"][0].why_it_matters == ""

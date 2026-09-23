@@ -6,7 +6,7 @@ import sys
 from zoneinfo import ZoneInfo
 
 from daily_intel_bot.config import load_settings
-from daily_intel_bot.delivery import send_daily_digest
+from daily_intel_bot.delivery import digest_sent_today, send_daily_digest
 from daily_intel_bot.obs import get_logger, setup_logging
 from daily_intel_bot.pipeline import build_digest_text
 from daily_intel_bot.poller import run_command_loop
@@ -77,6 +77,11 @@ def main() -> None:
         help="Send the real digest built from live public sources.",
     )
     parser.add_argument(
+        "--if-missed",
+        action="store_true",
+        help="With --send-digest: skip if today's brief already went out.",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="Run the Telegram command loop (/done, /status, /quiz, …).",
@@ -111,6 +116,9 @@ def main() -> None:
         return
 
     if args.send_digest:
+        if args.if_missed and digest_sent_today(settings):
+            print("digest-already-sent-today=1")
+            return
         delivered = send_daily_digest(settings)
         if delivered.photo_message_id is not None:
             print(f"persona-image=ok photo_message_id={delivered.photo_message_id}")

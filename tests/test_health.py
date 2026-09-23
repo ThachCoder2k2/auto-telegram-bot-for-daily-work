@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -27,6 +28,7 @@ def settings(tmp_path, monkeypatch) -> Settings:
     monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "t.db"))
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "555")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TIMEZONE", "Asia/Ho_Chi_Minh")
     return Settings()
 
 
@@ -146,3 +148,57 @@ def test_unreachable_telegram_raises_instead_of_looking_idle(settings, monkeypat
     monkeypatch.setattr(module.request, "urlopen", _boom)
     with pytest.raises(TelegramUnavailable):
         fetch_updates(settings, 0, timeout=0)
+
+
+# --- missed-brief catch-up ------------------------------------------------
+
+
+def test_catch_up_is_idempotent_within_the_day(settings, monkeypatch):
+    """A redeploy after send time must recover the day, not duplicate it."""
+    from daily_intel_bot import delivery
+
+    store = StateStore(settings.state_db_path)
+    tz = ZoneInfo(settings.timezone)
+    assert delivery.digest_sent_today(settings) is False
+
+    health.note_digest_sent(store, datetime.now(tz))
+    assert delivery.digest_sent_today(settings) is True
+
+
+def test_yesterdays_brief_does_not_count_as_todays(settings):
+    from daily_intel_bot import delivery
+
+    store = StateStore(settings.state_db_path)
+    tz = ZoneInfo(settings.timezone)
+    health.note_digest_sent(store, datetime.now(tz) - timedelta(days=1))
+    assert delivery.digest_sent_today(settings) is False
+
+
+def test_a_utc_stamp_is_read_in_the_local_day(settings):
+    """The stamp is stored UTC; 'today' means the user's calendar day."""
+    from daily_intel_bot import delivery
+
+    store = StateStore(settings.state_db_path)
+    tz = ZoneInfo(settings.timezone)
+    local_now = datetime.now(tz)
+    store.set_meta(
+        health.LAST_DIGEST_META_KEY,
+        local_now.astimezone(timezone.utc).isoformat(),
+    )
+    assert delivery.digest_sent_today(settings) is True
+
+
+def test_scheduler_knows_when_the_send_time_has_passed():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "sched", Path(__file__).resolve().parents[1] / "docker" / "scheduler.py"
+    )
+    sched = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sched)
+
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    # 00:00 is never past an 08:00 target; 23:59 always is.
+    assert sched.now_past_target(tz, 23, 59) is False
+    assert sched.now_past_target(tz, 0, 0) is True

@@ -657,6 +657,7 @@ def _apply_item_takes(
         return news_by_category
 
     use_gemini = settings.ai_provider == "gemini"
+    provider = "gemini" if use_gemini else "openai"
     if use_gemini:
         if not settings.gemini_api_key:
             return news_by_category

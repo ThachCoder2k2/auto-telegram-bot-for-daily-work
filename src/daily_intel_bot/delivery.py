@@ -8,7 +8,7 @@ briefing state, recording vocabulary — cannot drift between the two.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,26 @@ class DeliveryResult:
     photo_message_id: int | None
     items_sent: int
     vocabulary_added: int
+
+
+def digest_sent_today(settings: Settings) -> bool:
+    """Has a brief already been delivered on the user's calendar day?
+
+    Makes catch-up runs idempotent: the scheduler can safely try on every
+    start without risking a second brief.
+    """
+    now = datetime.now(ZoneInfo(settings.timezone))
+    store = StateStore(settings.state_db_path)
+    raw = store.get_meta(health.LAST_DIGEST_META_KEY, "")
+    if not raw:
+        return False
+    try:
+        last = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return last.astimezone(ZoneInfo(settings.timezone)).date() == now.date()
 
 
 def send_daily_digest(settings: Settings) -> DeliveryResult:
