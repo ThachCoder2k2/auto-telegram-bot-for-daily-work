@@ -21,6 +21,16 @@ from daily_intel_bot.obs import get_logger
 _LOG = get_logger("telegram_updates")
 
 OFFSET_META_KEY = "telegram_update_offset"
+
+
+class TelegramUnavailable(RuntimeError):
+    """getUpdates could not be reached.
+
+    Raised rather than returned as an empty result: an empty result is
+    indistinguishable from "no new messages", and the caller would loop
+    straight back in. Because a failed call returns instantly instead of
+    blocking for the long poll, that turned a DNS outage into a hot loop
+    hammering the network ~1000 times a second."""
 # Telegram allows up to 50s; keep headroom under the socket timeout below.
 LONG_POLL_SECONDS = 30
 
@@ -64,12 +74,10 @@ def fetch_updates(
         with request.urlopen(req, timeout=timeout + 15) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except (error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        _LOG.warning("getUpdates failed: %s: %s", type(exc).__name__, exc)
-        return [], offset
+        raise TelegramUnavailable(f"{type(exc).__name__}: {exc}") from exc
 
     if not payload.get("ok"):
-        _LOG.warning("getUpdates returned not-ok: %s", payload)
-        return [], offset
+        raise TelegramUnavailable(f"API returned not-ok: {payload}")
 
     commands: list[TelegramCommand] = []
     next_offset = offset

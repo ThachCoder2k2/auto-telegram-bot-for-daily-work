@@ -141,6 +141,23 @@ class StateStore:
                 )
                 """
             )
+            # Outcome of every outbound call, so health can be reported from
+            # what actually happened rather than from what was configured.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service TEXT NOT NULL,
+                    ok INTEGER NOT NULL,
+                    status INTEGER,
+                    detail TEXT NOT NULL DEFAULT '',
+                    at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_api_calls_at ON api_calls(at)"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_events_day ON task_events(day)"
             )
@@ -461,6 +478,80 @@ class StateStore:
                 "SELECT COUNT(*) FROM vocab WHERE box >= ?", (MAX_LEITNER_BOX,)
             ).fetchone()[0]
         return int(total), int(mastered)
+
+    # --- api health -------------------------------------------------------
+
+    def record_api_call(
+        self,
+        service: str,
+        ok: bool,
+        status: int | None = None,
+        detail: str = "",
+        now: datetime | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_calls (service, ok, status, detail, at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    service,
+                    1 if ok else 0,
+                    status,
+                    detail[:200],
+                    _as_utc(now or datetime.now(timezone.utc)).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def api_health(self, within_hours: int = 24) -> dict[str, dict[str, int]]:
+        """Per-service call counts: total, failures, and rate-limited."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=within_hours)
+        ).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT service,
+                       COUNT(*),
+                       SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END)
+                FROM api_calls
+                WHERE at >= ?
+                GROUP BY service
+                """,
+                (cutoff,),
+            ).fetchall()
+        return {
+            row[0]: {
+                "total": int(row[1]),
+                "failed": int(row[2] or 0),
+                "rate_limited": int(row[3] or 0),
+            }
+            for row in rows
+        }
+
+    def last_api_failure(self, service: str) -> tuple[str, str] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT at, detail FROM api_calls
+                WHERE service = ? AND ok = 0
+                ORDER BY id DESC LIMIT 1
+                """,
+                (service,),
+            ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def prune_api_calls(self, keep_days: int = 7) -> None:
+        """Keep the health log bounded; it is sampled, not archived."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=keep_days)
+        ).isoformat()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM api_calls WHERE at < ?", (cutoff,))
+            conn.commit()
 
     # --- reminder counts --------------------------------------------------
 

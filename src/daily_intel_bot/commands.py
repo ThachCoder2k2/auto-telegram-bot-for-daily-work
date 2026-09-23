@@ -21,7 +21,7 @@ from daily_intel_bot.briefing import (
     load_briefing_state,
     save_briefing_state,
 )
-from daily_intel_bot import notion_tasks
+from daily_intel_bot import health, notion_tasks
 from daily_intel_bot.config import Settings
 from daily_intel_bot.notion_client import NotionError
 from daily_intel_bot.obs import get_logger
@@ -460,6 +460,13 @@ def _cmd_status(settings: Settings, argument: str) -> CommandResult:
     return CommandResult(reply="\n".join(lines))
 
 
+def _cmd_health(settings: Settings, argument: str) -> CommandResult:
+    store = StateStore(settings.state_db_path)
+    return CommandResult(
+        reply=health.render_report(store, settings, _now(settings))
+    )
+
+
 def _cmd_digest(settings: Settings, argument: str) -> CommandResult:
     return CommandResult(reply="📨 Building today's brief…", action="send_digest")
 
@@ -495,6 +502,7 @@ def _help_text() -> str:
             "",
             "<b>Other</b>",
             "/status — streak, tasks, trends",
+            "/health — delivery and API health",
             "/digest — send today's brief now",
             "",
             "<i>Plain text with no command is filed as a note on the current task.</i>",
@@ -528,6 +536,7 @@ _HANDLERS = {
     "/ntasks": _cmd_ntasks,
     "/ndone": _cmd_ndone,
     "/status": _cmd_status,
+    "/health": _cmd_health,
     "/digest": _cmd_digest,
     "/help": _cmd_help,
     "/start": _cmd_help,

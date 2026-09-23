@@ -20,3 +20,10 @@ services:
       # Persist sent-item history + briefing state across restarts.
       - ./state:/app/state
     restart: unless-stopped
+    # A network outage once produced 900k log lines in two days; without a cap
+    # the host disk is what fails next.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

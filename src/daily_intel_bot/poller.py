@@ -42,6 +42,7 @@ from daily_intel_bot.state_store import StateStore
 from daily_intel_bot.telegram_client import send_message
 from daily_intel_bot.telegram_updates import (
     OFFSET_META_KEY,
+    TelegramUnavailable,
     fetch_updates,
 )
 
@@ -100,6 +101,11 @@ def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
             if _hour_slot_turned(settings, store):
                 send_due_reminders(settings, store)
                 send_due_note_alerts(settings, store)
+        except TelegramUnavailable as exc:
+            # A failed poll returns instantly, so without this sleep the loop
+            # spins as fast as the CPU allows for the whole outage.
+            _LOG.warning("Telegram unreachable, backing off: %s", exc)
+            time.sleep(ERROR_SLEEP_SECONDS)
         except Exception as exc:  # noqa: BLE001 - the loop must outlive failures
             _LOG.exception("command loop error: %s", type(exc).__name__)
             time.sleep(ERROR_SLEEP_SECONDS)
@@ -364,5 +370,9 @@ def _load_offset(settings: Settings, store: StateStore) -> int:
 def prime_offset(settings: Settings) -> int:
     """Return the offset just past the newest pending update."""
     # offset=-1 asks Telegram for only the most recent update.
-    _commands, offset = fetch_updates(settings, -1, timeout=0)
+    try:
+        _commands, offset = fetch_updates(settings, -1, timeout=0)
+    except TelegramUnavailable as exc:
+        _LOG.warning("could not prime offset: %s", exc)
+        return 0
     return max(0, offset)

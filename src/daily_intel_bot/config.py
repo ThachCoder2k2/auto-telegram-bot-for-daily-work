@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     # How long an already-sent story stays suppressed.
     repeat_window_days: int = 5
     # Two-way command loop.
+    # Mirrors the scheduler's env so the health report can state the next run.
+    daily_send_hour: int = 8
+    daily_send_minute: int = 0
     commands_enabled: bool = True
     command_poll_seconds: int = 30
     # Weekly recap section; 6 = Sunday in Python's weekday numbering.

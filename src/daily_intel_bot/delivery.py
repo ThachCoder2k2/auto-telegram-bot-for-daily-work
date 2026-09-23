@@ -12,6 +12,7 @@ from datetime import datetime
 from html import escape
 from zoneinfo import ZoneInfo
 
+from daily_intel_bot import health
 from daily_intel_bot.briefing import persist_briefing_state
 from daily_intel_bot.config import Settings
 from daily_intel_bot.obs import get_logger
@@ -43,6 +44,10 @@ def send_daily_digest(settings: Settings) -> DeliveryResult:
     result = send_message(settings, text)
 
     store = StateStore(settings.state_db_path)
+    # Recorded only after a successful send, so 'no brief for two days' is
+    # something the bot can notice rather than something the user discovers.
+    health.note_digest_sent(store, datetime.now(ZoneInfo(settings.timezone)))
+    store.prune_api_calls()
     store.mark_sent(bundle.selected_items)
     vocabulary_added = store.record_vocabulary(list(bundle.vocabulary))
     if settings.briefing_mode == "dev_ielts":

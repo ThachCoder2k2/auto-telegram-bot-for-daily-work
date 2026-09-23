@@ -14,6 +14,17 @@ from daily_intel_bot.config import Settings
 TELEGRAM_TEXT_LIMIT = 3900
 
 
+def _record_health(settings: Settings, exc: Exception | None) -> None:
+    """Log the delivery outcome without letting health break delivery."""
+    try:
+        from daily_intel_bot import health
+        from daily_intel_bot.state_store import StateStore
+
+        health.record(StateStore(settings.state_db_path), "telegram", exc)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def send_message(settings: Settings, text: str) -> dict[str, object]:
     if not settings.telegram_bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN is missing")
@@ -21,8 +32,13 @@ def send_message(settings: Settings, text: str) -> dict[str, object]:
         raise ValueError("TELEGRAM_CHAT_ID is missing")
 
     results: list[dict[str, object]] = []
-    for part in _split_html_message(text):
-        results.append(_send_message_part(settings, part))
+    try:
+        for part in _split_html_message(text):
+            results.append(_send_message_part(settings, part))
+    except Exception as exc:
+        _record_health(settings, exc)
+        raise
+    _record_health(settings, None)
     if not results:
         raise ValueError("Message text is empty")
     if len(results) == 1:

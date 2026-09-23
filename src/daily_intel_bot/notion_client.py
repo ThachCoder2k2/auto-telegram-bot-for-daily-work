@@ -131,7 +131,7 @@ def _call(
             return json.loads(resp.read().decode("utf-8"))
 
     try:
-        return with_retries(
+        result = with_retries(
             _once,
             attempts=3,
             backoff=2.0,
@@ -140,6 +140,7 @@ def _call(
             should_retry=is_transient_http_error,
         )
     except error.HTTPError as exc:
+        _record(settings, exc)
         detail = exc.read().decode("utf-8", "replace")[:200]
         if exc.code == 404:
             # By far the most common setup mistake, and the error message
@@ -156,7 +157,20 @@ def _call(
             ) from exc
         raise NotionError(f"{exc.code} from Notion: {detail}") from exc
     except (error.URLError, TimeoutError, OSError) as exc:
+        _record(settings, exc)
         raise NotionError(f"Notion unreachable: {type(exc).__name__}: {exc}") from exc
+    _record(settings, None)
+    return result
+
+
+def _record(settings: Settings, exc: Exception | None) -> None:
+    try:
+        from daily_intel_bot import health
+        from daily_intel_bot.state_store import StateStore
+
+        health.record(StateStore(settings.state_db_path), "notion", exc)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --- discovery ------------------------------------------------------------

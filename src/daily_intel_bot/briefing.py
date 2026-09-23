@@ -34,6 +34,7 @@ from daily_intel_bot.notion_tasks import (
     load_notes_quietly,
     remember_task_order,
 )
+from daily_intel_bot import health
 from daily_intel_bot.obs import get_logger, is_transient_http_error, with_retries
 from daily_intel_bot.persona import PersonaProfile, persona_intro, select_persona
 from daily_intel_bot.reminders import (
@@ -531,6 +532,8 @@ def render_daily_briefing(
         for item in items
     ):
         lines.append("⚠️ <i>Per-item takes unavailable this run</i>")
+    for problem in health.alerts(store, settings, now):
+        lines.append(f"🚨 <i>{escape(problem)}</i>")
     lines.append(
         f"[PERSISTENCE: {now.strftime('%Y-%m-%d')} | Tasks Remaining: {escape(task_text)} | Current Project Focus: {escape(focus)}]"
     )
@@ -711,7 +714,9 @@ def _apply_item_takes(
             should_retry=is_transient_http_error,
         )
         takes = parse_takes(payload, len(requests))
+        health.record(StateStore(settings.state_db_path), provider)
     except Exception as exc:  # noqa: BLE001 - enrichment is strictly optional
+        health.record(StateStore(settings.state_db_path), provider, exc)
         _LOG.warning(
             "item takes failed, rendering without them: %s: %s",
             type(exc).__name__,
@@ -1422,7 +1427,9 @@ def _generate_ai_sections(
             label=f"AI sections via {provider}",
             should_retry=is_transient_http_error,
         )
+        health.record(StateStore(settings.state_db_path), provider)
     except Exception as exc:
+        health.record(StateStore(settings.state_db_path), provider, exc)
         _LOG.warning(
             "AI sections via %s failed, using rule-based fallback: %s: %s",
             provider,
