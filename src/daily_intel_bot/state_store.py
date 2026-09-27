@@ -158,6 +158,17 @@ class StateStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_api_calls_at ON api_calls(at)"
             )
+            # Snoozes live here rather than in Notion: pushing a future date
+            # into the user's own Last Reminded column would misreport when
+            # they were actually nudged.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS snoozes (
+                    page_id TEXT PRIMARY KEY,
+                    until TEXT NOT NULL
+                )
+                """
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_events_day ON task_events(day)"
             )
@@ -552,6 +563,28 @@ class StateStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM api_calls WHERE at < ?", (cutoff,))
             conn.commit()
+
+    # --- snoozes ----------------------------------------------------------
+
+    def snooze_task(self, page_id: str, until: datetime) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO snoozes (page_id, until) VALUES (?, ?)
+                ON CONFLICT(page_id) DO UPDATE SET until = excluded.until
+                """,
+                (page_id, _as_utc(until).isoformat()),
+            )
+            conn.commit()
+
+    def snoozed_page_ids(self, now: datetime | None = None) -> set[str]:
+        """Tasks still inside their snooze window."""
+        stamp = _as_utc(now or datetime.now(timezone.utc)).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT page_id FROM snoozes WHERE until > ?", (stamp,)
+            ).fetchall()
+        return {row[0] for row in rows}
 
     # --- reminder counts --------------------------------------------------
 

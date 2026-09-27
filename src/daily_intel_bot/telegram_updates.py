@@ -43,11 +43,24 @@ class TelegramCommand:
     from_user: str
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramCallback:
+    """A tapped inline button."""
+
+    update_id: int
+    callback_id: str
+    chat_id: str
+    message_id: int
+    data: str
+    keyboard: list
+    text: str
+
+
 def fetch_updates(
     settings: Settings,
     offset: int,
     timeout: int = LONG_POLL_SECONDS,
-) -> tuple[list[TelegramCommand], int]:
+) -> tuple[list[TelegramCommand | TelegramCallback], int]:
     """Long-poll for new messages.
 
     Returns the parsed commands plus the next offset to use. On a network or
@@ -60,8 +73,9 @@ def fetch_updates(
         {
             "timeout": timeout,
             "offset": offset,
-            # Only messages matter; ignore edits, callbacks and channel posts.
-            "allowed_updates": json.dumps(["message"]),
+            # Buttons arrive as callback_query; without it here Telegram
+            # simply never delivers a tap.
+            "allowed_updates": json.dumps(["message", "callback_query"]),
         }
     )
     url = (
@@ -79,7 +93,7 @@ def fetch_updates(
     if not payload.get("ok"):
         raise TelegramUnavailable(f"API returned not-ok: {payload}")
 
-    commands: list[TelegramCommand] = []
+    commands: list[TelegramCommand | TelegramCallback] = []
     next_offset = offset
     for update in payload.get("result", []):
         if not isinstance(update, dict):
@@ -90,13 +104,13 @@ def fetch_updates(
         # Acknowledge every update we saw, even ones we skip below, so a
         # non-text message cannot wedge the poll loop forever.
         next_offset = max(next_offset, update_id + 1)
-        command = _parse_message(update)
-        if command is None:
+        event = _parse_message(update) or _parse_callback(update)
+        if event is None:
             continue
-        if not _is_authorized(settings, command.chat_id):
-            _LOG.warning("ignoring message from unauthorized chat %s", command.chat_id)
+        if not _is_authorized(settings, event.chat_id):
+            _LOG.warning("ignoring event from unauthorized chat %s", event.chat_id)
             continue
-        commands.append(command)
+        commands.append(event)
     return commands, next_offset
 
 
@@ -122,6 +136,32 @@ def _parse_message(update: dict[str, object]) -> TelegramCommand | None:
         chat_id=str(chat_id),
         text=text.strip(),
         from_user=username,
+    )
+
+
+def _parse_callback(update: dict[str, object]) -> TelegramCallback | None:
+    query = update.get("callback_query")
+    if not isinstance(query, dict):
+        return None
+    data = query.get("data")
+    message = query.get("message")
+    if not isinstance(data, str) or not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict) or chat.get("id") is None:
+        return None
+    markup = message.get("reply_markup")
+    keyboard = (
+        markup.get("inline_keyboard", []) if isinstance(markup, dict) else []
+    )
+    return TelegramCallback(
+        update_id=int(update["update_id"]),  # validated by the caller
+        callback_id=str(query.get("id") or ""),
+        chat_id=str(chat["id"]),
+        message_id=int(message.get("message_id") or 0),
+        data=data,
+        keyboard=keyboard if isinstance(keyboard, list) else [],
+        text=str(message.get("text") or ""),
     )
 
 

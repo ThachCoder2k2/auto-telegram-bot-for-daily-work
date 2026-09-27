@@ -25,7 +25,11 @@ def _record_health(settings: Settings, exc: Exception | None) -> None:
         pass
 
 
-def send_message(settings: Settings, text: str) -> dict[str, object]:
+def send_message(
+    settings: Settings,
+    text: str,
+    reply_markup: dict | None = None,
+) -> dict[str, object]:
     if not settings.telegram_bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN is missing")
     if not settings.telegram_chat_id:
@@ -33,8 +37,12 @@ def send_message(settings: Settings, text: str) -> dict[str, object]:
 
     results: list[dict[str, object]] = []
     try:
-        for part in _split_html_message(text):
-            results.append(_send_message_part(settings, part))
+        parts = _split_html_message(text)
+        for index, part in enumerate(parts):
+            # Buttons belong on the last part: that is the one still on screen
+            # after a long brief has been split.
+            markup = reply_markup if index == len(parts) - 1 else None
+            results.append(_send_message_part(settings, part, markup))
     except Exception as exc:
         _record_health(settings, exc)
         raise
@@ -51,15 +59,20 @@ def send_message(settings: Settings, text: str) -> dict[str, object]:
     return results[-1]
 
 
-def _send_message_part(settings: Settings, text: str) -> dict[str, object]:
-    payload = parse.urlencode(
-        {
-            "chat_id": settings.telegram_chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }
-    ).encode("utf-8")
+def _send_message_part(
+    settings: Settings,
+    text: str,
+    reply_markup: dict | None = None,
+) -> dict[str, object]:
+    fields = {
+        "chat_id": settings.telegram_chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }
+    if reply_markup:
+        fields["reply_markup"] = json.dumps(reply_markup)
+    payload = parse.urlencode(fields).encode("utf-8")
     url = (
         f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
     )
@@ -216,4 +229,50 @@ def _send_photo_file(
     data = json.loads(response_body)
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
+    return data
+
+
+def answer_callback_query(
+    settings: Settings,
+    callback_id: str,
+    text: str = "",
+) -> None:
+    """Acknowledge a button press.
+
+    Telegram shows a spinner on the button until this is called, so skipping
+    it leaves the user staring at a tap that appears to have done nothing.
+    """
+    fields: dict[str, object] = {"callback_query_id": callback_id}
+    if text:
+        fields["text"] = text[:200]
+    _post(settings, "answerCallbackQuery", fields)
+
+
+def edit_message_text(
+    settings: Settings,
+    message_id: int,
+    text: str,
+    reply_markup: dict | None = None,
+) -> None:
+    """Rewrite a message in place, so a handled task stops looking pending."""
+    fields: dict[str, object] = {
+        "chat_id": settings.telegram_chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }
+    fields["reply_markup"] = json.dumps(reply_markup or {"inline_keyboard": []})
+    _post(settings, "editMessageText", fields)
+
+
+def _post(settings: Settings, method: str, fields: dict[str, object]) -> dict:
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/{method}"
+    payload = parse.urlencode(fields).encode("utf-8")
+    req = request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error on {method}: {data}")
     return data

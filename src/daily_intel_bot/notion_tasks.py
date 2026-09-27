@@ -14,6 +14,7 @@ import json
 from daily_intel_bot.config import Settings
 from daily_intel_bot.notion_client import (
     NoteEntry,
+    set_reminder_flag,
     NotionError,
     NotionSchema,
     NotionTask,
@@ -139,6 +140,16 @@ def complete_task(
     if not settings.notion_write_enabled:
         raise NotionError("NOTION_WRITE_ENABLED is false; refusing to edit Notion")
     mark_task_done(settings, page_id, schema)
+
+
+def stop_reminding(
+    settings: Settings,
+    schema: NotionSchema,
+    page_id: str,
+) -> None:
+    if not settings.notion_write_enabled:
+        raise NotionError("NOTION_WRITE_ENABLED is false; refusing to edit Notion")
+    set_reminder_flag(settings, page_id, schema, enabled=False)
 
 
 def stamp_reminded(

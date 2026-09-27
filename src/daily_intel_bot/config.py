@@ -117,6 +117,9 @@ class Settings(BaseSettings):
     # Let the AI backend write the nudge in the day's persona voice, the way
     # it already writes the brief. Falls back to the canned persona lines.
     notion_ai_voice_enabled: bool = True
+    # Tap-to-reply buttons on each nudge, and how long the snooze lasts.
+    notion_buttons_enabled: bool = True
+    notion_snooze_hours: int = 3
     notion_prop_status: str = ""
     notion_prop_priority: str = ""
     notion_prop_last_reminded: str = ""

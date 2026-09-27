@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 import time
 from zoneinfo import ZoneInfo
 
+from html import escape
+
+from daily_intel_bot import callbacks
 from daily_intel_bot.commands import handle_command
 from daily_intel_bot.config import Settings
 from daily_intel_bot.delivery import send_daily_digest
@@ -33,15 +36,21 @@ from daily_intel_bot.persona import select_persona
 from daily_intel_bot.reminders import (
     NAG_THRESHOLD,
     ReminderWindow,
+    build_keyboard,
     due_reminders,
     notes_needing_alert,
     render_note_alert,
     render_reminder_batch,
 )
 from daily_intel_bot.state_store import StateStore
-from daily_intel_bot.telegram_client import send_message
+from daily_intel_bot.telegram_client import (
+    answer_callback_query,
+    edit_message_text,
+    send_message,
+)
 from daily_intel_bot.telegram_updates import (
     OFFSET_META_KEY,
+    TelegramCallback,
     TelegramUnavailable,
     fetch_updates,
 )
@@ -88,9 +97,13 @@ def run_command_loop(settings: Settings, max_cycles: int | None = None) -> None:
                 offset,
                 timeout=settings.command_poll_seconds,
             )
-            for command in commands:
-                _LOG.info("command from %s: %s", command.from_user, command.text)
-                _dispatch(settings, command.text)
+            for event in commands:
+                if isinstance(event, TelegramCallback):
+                    _LOG.info("button tapped: %s", event.data)
+                    _dispatch_callback(settings, event)
+                    continue
+                _LOG.info("command from %s: %s", event.from_user, event.text)
+                _dispatch(settings, event.text)
             if next_offset != offset:
                 offset = next_offset
                 store.set_meta(OFFSET_META_KEY, str(offset))
@@ -157,6 +170,7 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         window,
         tolerance,
         settings.notion_default_frequency,
+        store.snoozed_page_ids(now),
     )
     if not due:
         return 0
@@ -191,8 +205,15 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
     try:
         # One batched message: three separately-worded nudges an hour apart is
         # a notification, three identical ones at once is just noise.
+        keyboard = (
+            build_keyboard(due, settings.notion_snooze_hours)
+            if settings.notion_buttons_enabled
+            else None
+        )
         send_message(
-            settings, render_reminder_batch(due, now, persona, counts, voice)
+            settings,
+            render_reminder_batch(due, now, persona, counts, voice),
+            reply_markup=keyboard,
         )
     except Exception as exc:  # noqa: BLE001 - a failed nudge retries next cycle
         _LOG.warning("reminder send failed: %s: %s", type(exc).__name__, exc)
@@ -320,6 +341,28 @@ def _batch_fingerprint(tasks, counts: dict[str, int]) -> str:
 
 def _note_alert_key(page_id: str) -> str:
     return f"notion_note_alert:{page_id}"
+
+
+def _dispatch_callback(settings: Settings, event: TelegramCallback) -> None:
+    """Apply a tapped button and fold the result into the original message."""
+    result = callbacks.handle(settings, event.data)
+    try:
+        answer_callback_query(settings, event.callback_id, result.toast)
+    except Exception as exc:  # noqa: BLE001 - the action still happened
+        _LOG.warning("could not answer callback: %s", exc)
+
+    if not result.handled_page_id or not event.message_id:
+        return
+    remaining = callbacks.strip_handled_row(event.keyboard, result.handled_page_id)
+    try:
+        edit_message_text(
+            settings,
+            event.message_id,
+            f"{escape(event.text)}\n\n{result.note}",
+            {"inline_keyboard": remaining} if remaining else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - cosmetic only
+        _LOG.warning("could not update message: %s", exc)
 
 
 def _dispatch(settings: Settings, text: str) -> None:

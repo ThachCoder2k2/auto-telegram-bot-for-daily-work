@@ -60,6 +60,7 @@ def due_reminders(
     window: ReminderWindow,
     tolerance: timedelta = timedelta(0),
     default_frequency: str = "",
+    snoozed: set[str] | None = None,
 ) -> list[NotionTask]:
     """Tasks whose reminder interval has elapsed, most urgent first.
 
@@ -76,8 +77,12 @@ def due_reminders(
     """
     if not window.is_open(now):
         return []
+    snoozed = snoozed or set()
     due = [
-        task for task in tasks if _is_due(task, now, tolerance, default_frequency)
+        task
+        for task in tasks
+        if task.page_id not in snoozed
+        and _is_due(task, now, tolerance, default_frequency)
     ]
     return sorted(due, key=_urgency)
 
@@ -422,3 +427,12 @@ def _note_voice(persona: PersonaProfile, days: int) -> str:
 def _short(value: str, limit: int = 42) -> str:
     value = value.strip()
     return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+
+def build_keyboard(tasks: list[NotionTask], snooze_hours: int) -> dict:
+    """One row of replies per task, so answering costs a tap not a command."""
+    from daily_intel_bot.callbacks import button_row
+
+    return {
+        "inline_keyboard": [button_row(task.page_id, snooze_hours) for task in tasks]
+    }

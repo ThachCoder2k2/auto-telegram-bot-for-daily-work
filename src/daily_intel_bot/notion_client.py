@@ -484,6 +484,27 @@ def mark_task_done(
     )
 
 
+def set_reminder_flag(
+    settings: Settings,
+    page_id: str,
+    schema: NotionSchema,
+    enabled: bool,
+) -> None:
+    """Tick or untick the board's Reminder checkbox.
+
+    Chosen over deleting or archiving: the user can see what changed and undo
+    it in Notion with one click.
+    """
+    if not schema.reminder:
+        raise NotionError("board has no Reminder column to switch off")
+    _call(
+        settings,
+        f"/pages/{parse.quote(page_id)}",
+        body={"properties": {schema.reminder: {"checkbox": enabled}}},
+        method="PATCH",
+    )
+
+
 def touch_last_reminded(
     settings: Settings,
     page_id: str,
