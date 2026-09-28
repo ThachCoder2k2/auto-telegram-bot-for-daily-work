@@ -38,7 +38,10 @@ from daily_intel_bot.reminders import (
     ReminderWindow,
     build_keyboard,
     due_reminders,
+    escalation_keyboard,
+    is_escalation_point,
     notes_needing_alert,
+    render_escalation,
     render_note_alert,
     render_reminder_batch,
 )
@@ -171,16 +174,23 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
         tolerance,
         settings.notion_default_frequency,
         store.snoozed_page_ids(now),
+        store.reminder_counts(),
     )
     if not due:
         return 0
 
-    # Count the nudge before rendering so the message can say "lần 4" and
+    # Count the nudge before rendering so the message can say "nudge #4" and
     # escalate its tone on the same pass.
     counts = {
         task.page_id: store.record_reminder(task.page_id, task.title, now)
         for task in due
     }
+
+    # A task that has crossed a threshold gets a different question instead
+    # of the same nudge again; repeating it is the one thing already proven
+    # not to work.
+    escalating = [t for t in due if is_escalation_point(counts.get(t.page_id, 0))]
+    due = [t for t in due if t not in escalating]
     persona = select_persona(
         enabled=settings.bot_persona_enabled,
         rotation=settings.bot_persona_rotation,
@@ -193,6 +203,12 @@ def send_due_reminders(settings: Settings, store: StateStore) -> int:
     # fresh voice when the batch actually changed.
     fingerprint = _batch_fingerprint(due, counts)
     changed = store.get_meta(NUDGE_FINGERPRINT_META_KEY, "") != fingerprint
+    for task in escalating:
+        _send_escalation(settings, board, task, counts[task.page_id], persona, now)
+    if not due:
+        store.set_meta(NUDGE_FINGERPRINT_META_KEY, _batch_fingerprint([], {}))
+        return len(escalating)
+
     voice = (
         _write_voice(
             settings,
@@ -324,6 +340,21 @@ def _write_voice(
             exc,
         )
         return None
+
+
+def _send_escalation(settings, board, task, count, persona, now) -> None:
+    """Ask the harder question once, then let the back-off keep it quiet."""
+    try:
+        send_message(
+            settings,
+            render_escalation(task, count, persona),
+            reply_markup=escalation_keyboard(task),
+        )
+    except Exception as exc:  # noqa: BLE001 - never lose the ordinary nudges
+        _LOG.warning("escalation send failed: %s: %s", type(exc).__name__, exc)
+        return
+    stamp_reminded(settings, board.schema, task.page_id, now)
+    _LOG.info("escalated %r after %d unanswered nudges", task.title, count)
 
 
 def _batch_fingerprint(tasks, counts: dict[str, int]) -> str:

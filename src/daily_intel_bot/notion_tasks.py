@@ -7,13 +7,14 @@ wire details.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
 
 from daily_intel_bot.config import Settings
 from daily_intel_bot.notion_client import (
     NoteEntry,
+    NotesSchema,
     set_reminder_flag,
     NotionError,
     NotionSchema,
@@ -37,6 +38,11 @@ _LOG = get_logger("notion_tasks")
 # The numbered list the user last saw, so "/ndone 2" can mean something after
 # the message has scrolled away.
 TASK_INDEX_META_KEY = "notion_task_index"
+SCHEMA_META_KEY = "notion_schema_cache"
+NOTES_SCHEMA_META_KEY = "notion_notes_schema_cache"
+# A board's columns change when someone edits the board, which is rare; re-reading
+# them every hour was most of the bot's Notion traffic.
+SCHEMA_TTL_SECONDS = 6 * 3600
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,9 +62,45 @@ def is_configured(settings: Settings) -> bool:
 def load_board(settings: Settings, store: StateStore) -> Board:
     """Fetch the unfinished tasks, sorted for display."""
     data_source_id = resolve_data_source_id(settings, store)
-    schema = fetch_schema(settings, data_source_id)
+    schema = _cached_schema(
+        store,
+        SCHEMA_META_KEY,
+        lambda: fetch_schema(settings, data_source_id),
+        NotionSchema,
+    )
     tasks = fetch_tasks(settings, data_source_id, schema)
     return Board(schema=schema, tasks=sort_tasks(tasks))
+
+
+def _cached_schema(store: StateStore, key: str, fetch, kind):
+    """Read a board's columns at most once per TTL.
+
+    Detection is a whole extra round trip per cycle, and the answer only
+    changes when the user edits the board.
+    """
+    raw = store.get_meta(key, "")
+    if raw:
+        try:
+            payload = json.loads(raw)
+            fetched_at = datetime.fromisoformat(payload["at"])
+            if (
+                datetime.now(timezone.utc) - fetched_at
+            ).total_seconds() < SCHEMA_TTL_SECONDS:
+                return kind(**payload["schema"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            _LOG.debug("ignoring unreadable schema cache in %s", key)
+
+    schema = fetch()
+    store.set_meta(
+        key,
+        json.dumps(
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "schema": asdict(schema),
+            }
+        ),
+    )
+    return schema
 
 
 def load_board_quietly(settings: Settings, store: StateStore) -> Board | None:
@@ -99,7 +141,12 @@ def load_notes(settings: Settings, store: StateStore) -> list[NoteEntry]:
         data_source_id = str(sources[0].get("id") or "")
         store.set_meta(NOTES_DATA_SOURCE_META_KEY, data_source_id)
 
-    schema = fetch_notes_schema(settings, data_source_id)
+    schema = _cached_schema(
+        store,
+        NOTES_SCHEMA_META_KEY,
+        lambda: fetch_notes_schema(settings, data_source_id),
+        NotesSchema,
+    )
     return fetch_notes(settings, data_source_id, schema)
 
 

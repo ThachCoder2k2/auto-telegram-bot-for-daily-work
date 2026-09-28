@@ -795,3 +795,42 @@ def test_a_deploy_mid_hour_waits_for_the_next_hour(settings, monkeypatch):
 
     poller_module.run_command_loop(Settings(), max_cycles=1)
     assert fired == []
+
+
+def test_schema_is_read_once_per_ttl_not_once_per_cycle(settings, monkeypatch):
+    """Re-detecting columns every hour was most of the bot's Notion traffic."""
+    store = StateStore(settings.state_db_path)
+    calls = {"n": 0}
+
+    def _fetch():
+        calls["n"] += 1
+        return NotionSchema(title="Task", status="Status")
+
+    first = notion_tasks._cached_schema(store, "k", _fetch, NotionSchema)
+    second = notion_tasks._cached_schema(store, "k", _fetch, NotionSchema)
+    assert calls["n"] == 1
+    assert first == second
+    assert second.title == "Task"
+
+
+def test_an_unreadable_schema_cache_is_refetched(settings):
+    store = StateStore(settings.state_db_path)
+    store.set_meta("k", "not json")
+    schema = notion_tasks._cached_schema(
+        store, "k", lambda: NotionSchema(title="Task"), NotionSchema
+    )
+    assert schema.title == "Task"
+
+
+def test_a_stale_schema_cache_is_refetched(settings, monkeypatch):
+    store = StateStore(settings.state_db_path)
+    monkeypatch.setattr(notion_tasks, "SCHEMA_TTL_SECONDS", -1)
+    calls = {"n": 0}
+
+    def _fetch():
+        calls["n"] += 1
+        return NotionSchema(title="Task")
+
+    notion_tasks._cached_schema(store, "k", _fetch, NotionSchema)
+    notion_tasks._cached_schema(store, "k", _fetch, NotionSchema)
+    assert calls["n"] == 2

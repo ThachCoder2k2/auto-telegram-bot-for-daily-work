@@ -61,6 +61,7 @@ def due_reminders(
     tolerance: timedelta = timedelta(0),
     default_frequency: str = "",
     snoozed: set[str] | None = None,
+    counts: dict[str, int] | None = None,
 ) -> list[NotionTask]:
     """Tasks whose reminder interval has elapsed, most urgent first.
 
@@ -78,11 +79,18 @@ def due_reminders(
     if not window.is_open(now):
         return []
     snoozed = snoozed or set()
+    counts = counts or {}
     due = [
         task
         for task in tasks
         if task.page_id not in snoozed
-        and _is_due(task, now, tolerance, default_frequency)
+        and _is_due(
+            task,
+            now,
+            tolerance,
+            default_frequency,
+            backoff_multiplier(counts.get(task.page_id, 0)),
+        )
     ]
     return sorted(due, key=_urgency)
 
@@ -92,6 +100,7 @@ def _is_due(
     now: datetime,
     tolerance: timedelta = timedelta(0),
     default_frequency: str = "",
+    backoff: int = 1,
 ) -> bool:
     if not task.reminder or task.is_done:
         return False
@@ -110,7 +119,7 @@ def _is_due(
         return False
     if task.last_reminded is None:
         return True
-    return now - task.last_reminded >= interval - tolerance
+    return now - task.last_reminded >= (interval * backoff) - tolerance
 
 
 def _urgency(task: NotionTask) -> tuple[int, float]:
@@ -165,6 +174,27 @@ def render_task_line(index: int, task: NotionTask) -> str:
 # A task nudged this many times without being touched has stopped being
 # forgotten and started being avoided.
 NAG_THRESHOLD = 3
+
+# Unanswered nudges are evidence, not noise. A task ignored this many times
+# is not being forgotten — hourly nudging simply is not working for it, so the
+# bot slows down instead of repeating itself into the void. One task on the
+# live board reached 39 nudges without a single reply.
+BACKOFF_LEVELS = ((25, 24), (10, 4))
+# Counts at which the bot stops nudging and asks a different question instead.
+ESCALATION_POINTS = (10, 25)
+
+
+def backoff_multiplier(count: int) -> int:
+    """How much to stretch a task's interval, given how often it went ignored."""
+    for threshold, multiplier in BACKOFF_LEVELS:
+        if count >= threshold:
+            return multiplier
+    return 1
+
+
+def is_escalation_point(count: int) -> bool:
+    """True exactly once per threshold, so the question is asked, not repeated."""
+    return count in ESCALATION_POINTS
 # Days untouched before a task counts as stalling.
 STALE_DAYS = 3
 
@@ -436,3 +466,34 @@ def build_keyboard(tasks: list[NotionTask], snooze_hours: int) -> dict:
     return {
         "inline_keyboard": [button_row(task.page_id, snooze_hours) for task in tasks]
     }
+
+
+def render_escalation(
+    task: NotionTask,
+    count: int,
+    persona: PersonaProfile | None,
+) -> str:
+    """Stop repeating the nudge and ask the question it has been dodging.
+
+    Repeating an unanswered message is the one response guaranteed not to
+    work; by this point the useful thing is to question the task itself.
+    """
+    lines: list[str] = []
+    if persona:
+        lines.append(f"{persona.icon} <b>{escape(persona.name)}</b>")
+        lines.append(f"<blockquote>{escape(persona.nag_line)}</blockquote>")
+    lines.append("")
+    lines.append(f"🔁 <b>{escape(task.title)}</b>")
+    lines.append(f"   <i>nudged {count} times, never actioned</i>")
+    lines.append("")
+    lines.append(
+        "This one is not getting done by being asked again. "
+        "Too big, no longer needed, or just not now?"
+    )
+    return "\n".join(lines)
+
+
+def escalation_keyboard(task: NotionTask) -> dict:
+    from daily_intel_bot.callbacks import escalation_row
+
+    return {"inline_keyboard": [escalation_row(task.page_id)]}

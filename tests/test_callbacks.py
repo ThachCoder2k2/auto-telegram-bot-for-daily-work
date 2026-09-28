@@ -213,3 +213,79 @@ def test_taps_arrive_as_callbacks_with_their_keyboard():
 
 def test_a_callback_without_a_message_is_ignored():
     assert _parse_callback({"update_id": 1, "callback_query": {"id": "q", "data": "x"}}) is None
+
+
+# --- back-off on silence --------------------------------------------------
+
+
+def test_an_ignored_task_is_nudged_less_often():
+    """39 unanswered hourly nudges is evidence hourly is not working."""
+    from daily_intel_bot.reminders import backoff_multiplier
+
+    assert backoff_multiplier(0) == 1
+    assert backoff_multiplier(9) == 1
+    assert backoff_multiplier(10) == 4
+    assert backoff_multiplier(25) == 24
+    assert backoff_multiplier(39) == 24
+
+
+def test_backoff_actually_delays_the_next_nudge():
+    task = _task()
+    object.__setattr__(task, "last_reminded", NOW - timedelta(hours=2))
+    always_open = ReminderWindow(0, 0)
+
+    # Untouched task: two hours is plenty for an hourly reminder.
+    assert due_reminders([task], NOW, always_open, counts={PAGE: 1}) == [task]
+    # Ignored 12 times: the interval has stretched to four hours.
+    assert due_reminders([task], NOW, always_open, counts={PAGE: 12}) == []
+
+
+def test_escalation_fires_once_per_threshold_not_every_time():
+    from daily_intel_bot.reminders import is_escalation_point
+
+    assert is_escalation_point(10) is True
+    assert is_escalation_point(11) is False
+    assert is_escalation_point(25) is True
+    assert is_escalation_point(39) is False
+
+
+def test_escalation_message_asks_a_different_question():
+    from daily_intel_bot.reminders import render_escalation
+
+    text = render_escalation(_task(), 39, None)
+    assert "39 times" in text
+    assert "Too big, no longer needed, or just not now?" in text
+
+
+def test_escalation_offers_ways_out_not_another_nudge():
+    from daily_intel_bot.callbacks import ACTION_LATER, ACTION_SPLIT, escalation_row
+
+    actions = [parse_action(b["callback_data"])[0] for b in escalation_row(PAGE)]
+    assert actions == [ACTION_SPLIT, ACTION_LATER, ACTION_STOP]
+
+
+def test_park_for_a_week_silences_without_touching_notion(settings, monkeypatch):
+    from daily_intel_bot.callbacks import ACTION_LATER, LATER_DAYS
+
+    monkeypatch.setattr(
+        callbacks.notion_tasks, "load_board", lambda *a: pytest.fail("no Notion call")
+    )
+    result = callbacks.handle(settings, f"{ACTION_LATER}:{PAGE}")
+    assert result.handled_page_id == PAGE
+
+    store = StateStore(settings.state_db_path)
+    assert PAGE in store.snoozed_page_ids()
+    assert PAGE not in store.snoozed_page_ids(
+        datetime.now(timezone.utc) + timedelta(days=LATER_DAYS + 1)
+    )
+
+
+def test_too_big_buys_a_day_and_says_what_to_do(settings, monkeypatch):
+    from daily_intel_bot.callbacks import ACTION_SPLIT
+
+    monkeypatch.setattr(
+        callbacks.notion_tasks, "load_board", lambda *a: pytest.fail("no Notion call")
+    )
+    result = callbacks.handle(settings, f"{ACTION_SPLIT}:{PAGE}")
+    assert "Split it into a first step" in result.note
+    assert PAGE in StateStore(settings.state_db_path).snoozed_page_ids()

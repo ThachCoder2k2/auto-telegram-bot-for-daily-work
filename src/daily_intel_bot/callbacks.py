@@ -28,6 +28,10 @@ _LOG = get_logger("callbacks")
 ACTION_DONE = "done"
 ACTION_SNOOZE = "snz"
 ACTION_STOP = "stop"
+ACTION_SPLIT = "split"
+ACTION_LATER = "later"
+# Days a "not now" answer at an escalation point buys.
+LATER_DAYS = 7
 # Telegram caps callback_data at 64 bytes; "snz:" plus a 36-char Notion uuid
 # leaves room to spare, but the prefixes stay short on purpose.
 CALLBACK_SEPARATOR = ":"
@@ -59,6 +63,21 @@ def button_row(page_id: str, snooze_hours: int) -> list[dict[str, str]]:
     ]
 
 
+def escalation_row(page_id: str) -> list[dict[str, str]]:
+    """The replies that actually move a stuck task, rather than repeat it."""
+    return [
+        {
+            "text": "✂️ Too big",
+            "callback_data": f"{ACTION_SPLIT}{CALLBACK_SEPARATOR}{page_id}",
+        },
+        {
+            "text": f"🗓 {LATER_DAYS}d",
+            "callback_data": f"{ACTION_LATER}{CALLBACK_SEPARATOR}{page_id}",
+        },
+        {"text": "🔕 Drop it", "callback_data": f"{ACTION_STOP}{CALLBACK_SEPARATOR}{page_id}"},
+    ]
+
+
 def handle(settings: Settings, data: str) -> CallbackResult:
     """Apply a tapped button. Never raises: a failed tap must still answer."""
     action, page_id = parse_action(data)
@@ -85,6 +104,29 @@ def handle(settings: Settings, data: str) -> CallbackResult:
             return CallbackResult(
                 toast=f"Quiet until {until.strftime('%H:%M')}",
                 note=f"😴 Snoozed until {until.strftime('%H:%M')}",
+                handled_page_id=page_id,
+            )
+
+        if action == ACTION_LATER:
+            until = now + timedelta(days=LATER_DAYS)
+            store.snooze_task(page_id, until)
+            return CallbackResult(
+                toast=f"Back on {until.strftime('%d %b')}",
+                note=f"🗓 Parked until {until.strftime('%d %b')}",
+                handled_page_id=page_id,
+            )
+
+        if action == ACTION_SPLIT:
+            # The bot cannot split the task for the user, but it can stop
+            # nagging about the version that is too big to start.
+            until = now + timedelta(days=1)
+            store.snooze_task(page_id, until)
+            return CallbackResult(
+                toast="Noted — split it in Notion",
+                note=(
+                    "✂️ Marked as too big. Split it into a first step in "
+                    "Notion; quiet until tomorrow."
+                ),
                 handled_page_id=page_id,
             )
 
